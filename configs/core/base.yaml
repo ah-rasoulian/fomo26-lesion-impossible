@@ -28,6 +28,10 @@ hydra:
           - run_id
           - stem
           - task
+          - logger.wandb_entity
+          - logger.wandb_logging
+          - logger.progress_bar
+          - data.train_split
 
   output_subdir: hydra
   run:
