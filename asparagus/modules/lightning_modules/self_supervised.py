@@ -15,6 +15,7 @@ from asparagus.functional.visualization import log_images_to_logger
 from asparagus.modules.lightning_modules.base_module import BaseModule
 from torchvision import transforms
 from typing import Optional
+from asparagus.modules.networks.sma_resunet import SpacingModalityResidualEncoderUNet
 
 
 class SelfSupervisedModule(BaseModule):
@@ -63,13 +64,18 @@ class SelfSupervisedModule(BaseModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
 
         if torch.isnan(y).any():
             logging.warning(f"Skipping batch {batch_idx} due to NaNs in input")
             return None
 
         mask = batch.get("mask", None)
-        pred, encoder_features = self.model.forward_with_features(x)
+        if isinstance(self.model, SpacingModalityResidualEncoderUNet):
+            pred, encoder_features = self.model.forward_with_features(x, spacing, modality)
+        else:
+            pred, encoder_features = self.model.forward_with_features(x)
 
         loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
         assert not torch.isnan(loss), "Reconstruction loss is NaN"
@@ -111,6 +117,8 @@ class SelfSupervisedModule(BaseModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
 
         if torch.isnan(y).any():
             logging.warning(f"Skipping batch {batch_idx} due to NaNs in input")
@@ -118,7 +126,10 @@ class SelfSupervisedModule(BaseModule):
 
         mask = batch.get("mask", None)
 
-        pred, encoder_features = self.model.forward_with_features(x)
+        if isinstance(self.model, SpacingModalityResidualEncoderUNet):
+            pred, encoder_features = self.model.forward_with_features(x, spacing, modality)
+        else:
+            pred, encoder_features = self.model.forward_with_features(x)
         loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
         assert not torch.isnan(loss), "Reconstruction loss is NaN"
 
