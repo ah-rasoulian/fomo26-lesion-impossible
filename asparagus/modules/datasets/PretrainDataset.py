@@ -1,6 +1,6 @@
 import torch
 import torchvision
-from asparagus.functional.loading import load_image_file
+from asparagus.functional.loading import load_image_file, get_file_info
 from torch.utils.data import Dataset
 from typing import Optional
 
@@ -22,7 +22,8 @@ class PretrainDataset(Dataset):
     def __getitem__(self, idx):
         file = self.files[idx]
         data = load_image_file(file)
-        data_dict = {"file_path": file, "image": data, "transforms_applied": {}}
+        info = get_file_info(file)
+        data_dict = {"file_path": file, "image": data, "transforms_applied": {}, "info": info}
         data_dict = self._transform(data_dict)  # CPU transforms only here
 
         if torch.isnan(data_dict["image"]).any() or torch.isinf(data_dict["image"]).any():
