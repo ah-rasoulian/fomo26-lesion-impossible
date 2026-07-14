@@ -6,8 +6,21 @@ from asparagus.paths import get_data_path, get_source_labels_path
 from gardening_tools.functional.nibabel_utils import reorient_nib_image
 from gardening_tools.functional.paths.read import load_pickle, read_file_to_nifti_or_np
 from gardening_tools.functional.type_conversions import nifti_or_np_to_np
+from asparagus.functional.loading import MODALITY_TO_ID
 from torch.utils.data import Dataset
 from typing import Optional
+
+
+def get_processed_data_info(file: str) -> dict:
+    if file.endswith(".pt"):
+        file = file.replace(".pt", "pkl")
+    info = load_pickle(file)
+    return {
+        "affine": torch.as_tensor(info["nifti_metadata"]["affine"], dtype=torch.float32),
+        "spacing": torch.as_tensor(info["new_spacing"], dtype=torch.float32),
+        "direction": info["new_direction"],
+        "modality": torch.tensor([MODALITY_TO_ID[m] for m in info["modalities"]], dtype=torch.long),
+    }
 
 
 class SegDataset(Dataset):
@@ -33,6 +46,7 @@ class SegDataset(Dataset):
             "image": data[:-1],
             "label": data[-1:],
             "foreground_locations": foreground_locations,
+            "info": get_processed_data_info(file),
             "transforms_applied": {},
         }
 
@@ -67,6 +81,7 @@ class ClsRegDataset(Dataset):
             "file_path": file,
             "image": data[0],
             "CLSREG_label": data[1],
+            "info": get_processed_data_info(file),
             "transforms_applied": {},
         }
 
@@ -106,6 +121,7 @@ class SegTestDataset(Dataset):
             "src_label": src_label,
             "properties": properties,
             "id": id,
+            "info": get_processed_data_info(file),
         }
 
         return self._transform(data_dict)
@@ -149,6 +165,7 @@ class ClsRegTestDataset(Dataset):
             "file_path": file,
             "image": data[0],
             "CLSREG_label": data[1],
+            "info": get_processed_data_info(file),
         }
 
         return self._transform(data_dict)
