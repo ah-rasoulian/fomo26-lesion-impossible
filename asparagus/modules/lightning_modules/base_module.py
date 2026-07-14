@@ -20,6 +20,8 @@ from torch.optim import SGD, AdamW
 from torchvision import transforms
 from typing import Optional
 
+from asparagus.modules.networks.sma_resunet import SpacingModalityResidualEncoderUNetCLSREG, SpacingModalityResidualEncoderUNet
+
 
 class BaseModule(L.LightningModule):
     def __init__(
@@ -292,3 +294,14 @@ class BaseModule(L.LightningModule):
         if (self.trainer.testing or self.trainer.predicting) and self.test_transforms is not None:
             batch = self.test_transforms(batch)
         return super().on_after_batch_transfer(batch, dataloader_idx)
+
+    def unwrap_compiled_model(self) -> nn.Module:
+        model = self.model
+        while hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        return model
+
+    def forward_requires_spacing_modality(self) -> bool:
+        if isinstance(self.unwrap_compiled_model(), SpacingModalityResidualEncoderUNetCLSREG) or isinstance(self.unwrap_compiled_model(), SpacingModalityResidualEncoderUNet):
+            return True
+        return False
