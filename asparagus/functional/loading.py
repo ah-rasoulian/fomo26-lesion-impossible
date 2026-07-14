@@ -104,7 +104,7 @@ def get_file_info(file):
             info = pickle.load(file_info)
 
         return {
-            "affine": torch.as_tensor(info["affine"], dtype=torch.float32),
+            "affine": torch.as_tensor(info["nifti_metadata"]["affine"], dtype=torch.float32),
             "spacing": torch.as_tensor(info["new_spacing"], dtype=torch.float32),
             "direction": info["new_direction"],
             "modality": modality_id,
