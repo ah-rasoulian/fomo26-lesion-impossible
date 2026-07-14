@@ -19,59 +19,65 @@ MODALITY_TO_ID: Dict[str, int] = {
     # -------------------------------------------------------------------------
     # Diffusion family
     # -------------------------------------------------------------------------
-    "_dwi": 1,          # Diffusion-weighted MRI; raw diffusion acquisition.
-    "_adc": 1,          # Apparent diffusion coefficient map; derived from DWI.
-    "_ADC": 1,          # Same as adc, uppercase filename variant.
+    "dwi": 1,          # Diffusion-weighted MRI; raw diffusion acquisition.
+    "dwi_b1000": 1,    # Diffusion-weighted MRI; raw diffusion acquisition.
+    "adc": 1,          # Apparent diffusion coefficient map; derived from DWI.
+    "ADC": 1,          # Same as adc, uppercase filename variant.
 
     # -------------------------------------------------------------------------
     # T1-weighted / T1-like anatomical family
     # -------------------------------------------------------------------------
-    "_T1w": 2,          # T1-weighted anatomical MRI.
-    "_UNIT1": 2,        # Uniform T1-weighted image, commonly derived from MP2RAGE.
-    "_MP2RAGE": 2,      # MP2RAGE T1-like/qT1 acquisition.
-    "_mp2rage": 2,      # Same as MP2RAGE, lowercase filename variant.
-    "_T1map": 2,        # Quantitative T1 relaxation map.
-    "_R1map": 2,        # Quantitative R1 map; inverse of T1.
+    "T1w": 2,          # T1-weighted anatomical MRI.
+    "t1": 2,
+    "t1w": 2,
+    "UNIT1": 2,        # Uniform T1-weighted image, commonly derived from MP2RAGE.
+    "MP2RAGE": 2,      # MP2RAGE T1-like/qT1 acquisition.
+    "mp2rage": 2,      # Same as MP2RAGE, lowercase filename variant.
+    "T1map": 2,        # Quantitative T1 relaxation map.
+    "R1map": 2,        # Quantitative R1 map; inverse of T1.
 
     # -------------------------------------------------------------------------
     # Contrast-enhanced T1
     # -------------------------------------------------------------------------
-    "_T1c": 3,          # Contrast-enhanced T1-weighted MRI; post-gadolinium T1.
+    "T1c": 3,          # Contrast-enhanced T1-weighted MRI; post-gadolinium T1.
 
     # -------------------------------------------------------------------------
     # T2 / fluid-sensitive anatomical family
     # -------------------------------------------------------------------------
-    "_T2w": 4,          # T2-weighted anatomical MRI.
-    "_FLAIR": 4,        # T2-like image with CSF suppression.
-    "_PDw": 4,          # Proton-density-weighted MRI; often structurally similar to T2/PD scans.
-    "_MESE": 4,         # Multi-echo spin-echo acquisition; often used for T2 mapping.
+    "T2w": 4,          # T2-weighted anatomical MRI.
+    "t2w": 4,
+    "FLAIR": 4,        # T2-like image with CSF suppression.
+    "flair": 4,        # T2-like image with CSF suppression, lowercase variant.
+    "PDw": 4,          # Proton-density-weighted MRI; often structurally similar to T2/PD scans.
+    "MESE": 4,         # Multi-echo spin-echo acquisition; often used for T2 mapping.
 
     # -------------------------------------------------------------------------
     # Susceptibility / gradient-echo family
     # -------------------------------------------------------------------------
-    "_swi": 5,          # Susceptibility-weighted imaging.
-    "_gre": 5,          # Gradient-echo image; broad susceptibility-sensitive family.
-    "_T2starw": 5,      # T2*-weighted MRI.
-    "_R2starmap": 5,    # Quantitative R2* map; inverse of T2*.
+    "swi": 5,          # Susceptibility-weighted imaging.
+    "gre": 5,          # Gradient-echo image; broad susceptibility-sensitive family.
+    "T2starw": 5,      # T2*-weighted MRI.
+    "t2s": 5,
+    "R2starmap": 5,    # Quantitative R2* map; inverse of T2*.
 
     # -------------------------------------------------------------------------
     # Perfusion / ASL family
     # -------------------------------------------------------------------------
-    "_asl": 6,          # Arterial spin labeling acquisition.
-    "_m0scan": 6,       # ASL M0 calibration image.
-    "_cbf": 6,          # Cerebral blood flow map; usually derived from ASL.
-    "_att": 6,          # Arterial transit time / arrival time map; usually derived from ASL.
+    "asl": 6,          # Arterial spin labeling acquisition.
+    "m0scan": 6,       # ASL M0 calibration image.
+    "cbf": 6,          # Cerebral blood flow map; usually derived from ASL.
+    "att": 6,          # Arterial transit time / arrival time map; usually derived from ASL.
 
     # -------------------------------------------------------------------------
     # Angiography family
     # -------------------------------------------------------------------------
-    "_angio": 7,        # MR angiography image.
+    "angio": 7,        # MR angiography image.
 
     # -------------------------------------------------------------------------
     # Other MRI acquisition families
     # -------------------------------------------------------------------------
-    "_FLASH": 8,        # Fast low-angle shot gradient-echo sequence; dataset-specific contrast.
-    "_UTE": 9,          # Ultrashort echo time MRI.
+    "FLASH": 8,        # Fast low-angle shot gradient-echo sequence; dataset-specific contrast.
+    "UTE": 9,          # Ultrashort echo time MRI.
 }
 
 
