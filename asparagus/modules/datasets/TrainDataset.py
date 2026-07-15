@@ -13,7 +13,7 @@ from typing import Optional
 
 def get_processed_data_info(file: str) -> dict:
     if file.endswith(".pt"):
-        file = file.replace(".pt", "pkl")
+        file = file.replace(".pt", ".pkl")
     info = load_pickle(file)
     return {
         "affine": torch.as_tensor(info["nifti_metadata"]["affine"], dtype=torch.float32),
