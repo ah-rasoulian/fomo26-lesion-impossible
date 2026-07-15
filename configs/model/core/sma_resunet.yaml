@@ -9,7 +9,7 @@ _seg_net:
   deep_supervision: ${model.deep_supervision}
 
 _cls_net:
-  _target_: asparagus.modules.networks.resenc_unet.${model.cls_net}
+  _target_: asparagus.modules.networks.sma_resunet.${model.cls_net}
   dimensions: ${model.dimensions}
   dropout_op_kwargs:
     encoder_dropout_rate: ${model.encoder_dropout_rate}
@@ -17,7 +17,7 @@ _cls_net:
     inplace: true
 
 _plugin_seg_net:
-  _target_: asparagus.modules.networks.resenc_unet.${model.plugin_seg_net}
+  _target_: asparagus.modules.networks.sma_resunet.${model.plugin_seg_net}
   dimensions: ${model.dimensions}
 
 pretrain_optim: AdamW
