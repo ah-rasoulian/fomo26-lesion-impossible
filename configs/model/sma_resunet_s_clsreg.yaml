@@ -1,0 +1,16 @@
+defaults:
+  - core/sma_resunet@
+
+dimensions: 3D
+
+pretrain_net:
+
+seg_net:
+cls_net: sma_resunet_s_clsreg
+
+plugin_seg_net:
+plugin_seg_train_n_last_params:
+
+# Dropout rates (0.0 = no dropout)
+encoder_dropout_rate: 0.0
+decoder_dropout_rate: 0.2
