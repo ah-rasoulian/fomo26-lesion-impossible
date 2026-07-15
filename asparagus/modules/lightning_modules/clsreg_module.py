@@ -74,8 +74,13 @@ class ClsRegBase(BaseModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["CLSREG_label"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
 
-        pred = self.model(x)
+        if self.forward_requires_spacing_modality():
+            pred = self.model(x, spacing, modality)
+        else:
+            pred = self.model(x)
         loss = self.loss(pred, y)
 
         self.log(
@@ -111,8 +116,13 @@ class ClsRegBase(BaseModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["CLSREG_label"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
 
-        pred = self.model(x)
+        if self.forward_requires_spacing_modality():
+            pred = self.model(x, spacing, modality)
+        else:
+            pred = self.model(x)
         loss = self.loss(pred, y)
         self.log("val/loss", loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.trainer.datamodule.batch_size)
 
@@ -149,12 +159,22 @@ class ClsRegBase(BaseModule):
 
     def test_step(self, batch, batch_idx):
         x = batch["image"]
-        outputs = self.model.forward(x)
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+        if self.forward_requires_spacing_modality():
+            outputs = self.model.forward(x, spacing, modality)
+        else:
+            outputs = self.model.forward(x)
         return outputs
 
     def predict_step(self, batch, batch_idx):
         x = batch["image"]
-        outputs = self.model.forward(x)
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+        if self.forward_requires_spacing_modality():
+            outputs = self.model.forward(x, spacing, modality)
+        else:
+            outputs = self.model.forward(x)
         return outputs
 
     def on_test_epoch_end(self):

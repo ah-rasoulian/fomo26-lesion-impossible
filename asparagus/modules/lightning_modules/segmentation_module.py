@@ -108,8 +108,12 @@ class SegmentationModule(BaseModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
-
-        pred = self.model(x)
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+        if self.forward_requires_spacing_modality():
+            pred = self.model(x, spacing, modality)
+        else:
+            pred = self.model(x)
         loss = self.train_loss(pred, y)
         self.log(
             "train/loss",
@@ -156,7 +160,13 @@ class SegmentationModule(BaseModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
-        pred = self.model(x)
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+
+        if self.forward_requires_spacing_modality():
+            pred = self.model(x, spacing, modality)
+        else:
+            pred = self.model(x)
         loss = self.val_loss(pred, y)
         self.log(
             "val/loss",
@@ -212,11 +222,20 @@ class SegmentationModule(BaseModule):
 
     def test_step(self, batch, batch_idx):
         x = batch["image"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
 
+        model_kwargs = {}
+        if self.forward_requires_spacing_modality():
+            model_kwargs.update(
+                spacing=spacing,
+                modality=modality,
+            )
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
             overlap=0.5,
+            **model_kwargs
         )
 
         src_logits = reverse_preprocessing(logits, batch["properties"])
@@ -241,10 +260,20 @@ class SegmentationModule(BaseModule):
 
     def predict_step(self, batch, batch_idx):
         x = batch["image"]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+
+        model_kwargs = {}
+        if self.forward_requires_spacing_modality():
+            model_kwargs.update(
+                spacing=spacing,
+                modality=modality,
+            )
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
             overlap=0.5,
+            **model_kwargs
         )
         src_logits = reverse_preprocessing(logits, batch["properties"])
         return src_logits, batch["properties"]

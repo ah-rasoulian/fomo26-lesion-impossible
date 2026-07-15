@@ -15,7 +15,6 @@ from asparagus.functional.visualization import log_images_to_logger
 from asparagus.modules.lightning_modules.base_module import BaseModule
 from torchvision import transforms
 from typing import Optional
-from asparagus.modules.networks.sma_resunet import SpacingModalityResidualEncoderUNet
 
 
 class SelfSupervisedModule(BaseModule):
@@ -72,7 +71,7 @@ class SelfSupervisedModule(BaseModule):
             return None
 
         mask = batch.get("mask", None)
-        if isinstance(self.model, SpacingModalityResidualEncoderUNet):
+        if self.forward_requires_spacing_modality():
             pred, encoder_features = self.model.forward_with_features(x, spacing, modality)
         else:
             pred, encoder_features = self.model.forward_with_features(x)
@@ -126,7 +125,7 @@ class SelfSupervisedModule(BaseModule):
 
         mask = batch.get("mask", None)
 
-        if isinstance(self.model, SpacingModalityResidualEncoderUNet):
+        if self.forward_requires_spacing_modality():
             pred, encoder_features = self.model.forward_with_features(x, spacing, modality)
         else:
             pred, encoder_features = self.model.forward_with_features(x)
@@ -193,5 +192,10 @@ class SelfSupervisedModule(BaseModule):
 
     def predict_step(self, batch, batch_idx):
         x = batch["image"]
-        embeddings = self.model.encoder(x)[-1]
+        info = batch['info']
+        affine, spacing, direction, modality = info['affine'], info['spacing'], info['direction'], info['modality']
+        if self.forward_requires_spacing_modality():
+            embeddings = self.model.encoder(x, spacing, modality)[-1]
+        else:
+            embeddings = self.model.encoder(x)[-1]
         return embeddings
