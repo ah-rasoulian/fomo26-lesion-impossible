@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, List
 import nibabel as nib
 from nibabel.orientations import aff2axcodes
 import numpy as np
@@ -80,6 +80,28 @@ MODALITY_TO_ID: Dict[str, int] = {
     "UTE": 9,          # Ultrashort echo time MRI.
 }
 
+def get_modality_id(files: str | List[str]) -> torch.Tensor:
+    def get_single_file_id(file):
+        file_name = os.path.basename(file)
+
+        modality_name = "UNKNOWN"
+        for mod in MODALITY_TO_ID.keys():
+            if mod in file_name:
+                modality_name = mod
+                break
+
+        if modality_name == "UNKNOWN":
+            warnings.warn(f"UNKNOWN modality: {file_name}")
+        return MODALITY_TO_ID[modality_name]
+
+    ids = []
+    if isinstance(files, str):
+        files = [files]
+
+    for f in files:
+        ids.append(get_single_file_id(f))
+    modality_id = torch.tensor(ids, dtype=torch.long)
+    return modality_id
 
 def load_image_file(file: str) -> torch.Tensor:
     if file.endswith(".pt"):
@@ -93,19 +115,9 @@ def load_image_file(file: str) -> torch.Tensor:
         raise ValueError(f"Unsupported file format: {file}. Expected .pt, .nii, or .nii.gz")
 
 def get_file_info(file):
-    file_name = os.path.basename(file)
+    modality_id = get_modality_id(file)
 
-    modality_name = "UNKNOWN"
-    for mod in MODALITY_TO_ID.keys():
-        if mod in file_name:
-            modality_name = mod
-            break
-
-    if modality_name == "UNKNOWN":
-        warnings.warn(f"UNKNOWN modality: {file_name}")
-    modality_id = torch.tensor(MODALITY_TO_ID[modality_name], dtype=torch.long)
-
-    if file_name.endswith(".pt"):
+    if file.endswith(".pt"):
         with open(file.replace(".pt", ".pkl"), "rb") as file_info:
             info = pickle.load(file_info)
 
@@ -116,7 +128,7 @@ def get_file_info(file):
             "modality": modality_id,
         }
 
-    elif file_name.endswith(".nii.gz") or file_name.endswith(".nii"):
+    elif file.endswith(".nii.gz") or file.endswith(".nii"):
 
         nii = nib.load(file)
         header = nii.header
