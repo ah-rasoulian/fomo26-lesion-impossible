@@ -6,7 +6,9 @@ from asparagus.paths import get_data_path, get_source_labels_path
 from gardening_tools.functional.nibabel_utils import reorient_nib_image
 from gardening_tools.functional.paths.read import load_pickle, read_file_to_nifti_or_np
 from gardening_tools.functional.type_conversions import nifti_or_np_to_np
+from asparagus.functional.loading import get_modality_id
 from asparagus.functional.loading import MODALITY_TO_ID
+from nibabel.orientations import aff2axcodes
 from torch.utils.data import Dataset
 from typing import Optional
 
@@ -217,6 +219,12 @@ class SingleSubjectPredictDataset(Dataset):
             "file_path": file,
             "image": data,
             "properties": properties,
+            "info": {
+                "affine": torch.as_tensor(properties["nifti_metadata"]["affine"], dtype=torch.float32),
+                "spacing": torch.as_tensor(properties["nifti_metadata"]["header"].get_zooms()[:3], dtype=torch.float32),
+                "direction": "".join(aff2axcodes(properties["nifti_metadata"]["affine"])),
+                "modality": get_modality_id(self.files),
+            }
         }
 
         return self._transform(data_dict)
