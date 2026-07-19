@@ -1,0 +1,106 @@
+Bootstrap: docker
+
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author Amirhossein Rasoulian
+    Challenge FOMO26
+    Task Task 1 - Infarct Classification
+    Version v1.0.4
+    Description FOMO26 Infarct Classification Apptainer Image
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Required by TorchInductor and Triton.
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
+    export CUDAHOSTCXX=/usr/bin/g++
+
+    # Writable runtime compilation caches.
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+
+    # Model location.
+    export MODEL_DIR=/app/model
+    export CHECKPOINT_NAME=best
+
+    # Required Asparagus paths.
+    export ASPARAGUS_DATA=/input
+    export ASPARAGUS_MODELS=/app/model
+    export ASPARAGUS_RESULTS=/output
+    export ASPARAGUS_CONFIGS=/app/configs
+    export ASPARAGUS_RAW_LABELS=/app/raw_labels
+
+    export ASPARAGUS_PRETRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_TRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_FINETUNE_CONFIGS=/app/configs
+    export ASPARAGUS_EVAL_BOX_CONFIGS=/app/configs
+
+    export WANDB_MODE=disabled
+    export WANDB_SILENT=true
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+
+%files
+    # Build from:
+    # /scratch/01/ahrasoulian/projects/fomo26
+
+    # Challenge entry point.
+    fomo26-lesion-impossible/submission/task1/predict.py /app/predict.py
+
+    # Python requirements.
+    fomo26-lesion-impossible/requirements.txt /app/requirements.txt
+
+    # Required application source and configurations.
+    fomo26-lesion-impossible/asparagus /app/asparagus
+    fomo26-lesion-impossible/configs /app/configs
+
+    # Trained Task 1 model.
+    models/CLS002_FOMO26_Infarct/sma_resunet_s_clsreg__3D/script=finetune_cls/root=base__stem=578257_last.ckpt/leaf=default_finetune_cls__clargs=data.fold=0,training.batch_size=2,training.epochs=50/split_80_10_10__fold=0/run_id=347680 /app/model
+
+%post
+    set -eu
+
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
+    export CUDAHOSTCXX=/usr/bin/g++
+
+    # Install the minimal compiler toolchain needed by TorchInductor/Triton.
+    apt-get update
+
+    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev
+
+    # Create the required empty directory.
+    mkdir -p /app/raw_labels
+
+    # Keep the PyTorch, Triton, and CUDA packages supplied by the base image.
+    # The filtered requirements file is small and may remain in the image.
+    grep -viE \
+        '^[[:space:]]*(torch|torchvision|torchaudio|triton|nvidia-[A-Za-z0-9_.-]+)([<>=!~[:space:]].*)?$' \
+        /app/requirements.txt \
+        > /app/requirements-runtime.txt
+
+    # Install runtime Python dependencies without creating a pip download cache
+    # or compiled Python bytecode.
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --prefer-binary \
+        -r /app/requirements-runtime.txt
+
+%runscript
+    exec python /app/predict.py "$@"

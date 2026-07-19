@@ -10,8 +10,8 @@ from torch.nn.functional import softmax
 
 load_dotenv()
 
-MODEL_DIR = None
-CHECKPOINT_NAME = None
+MODEL_DIR = "/scratch/01/ahrasoulian/projects/fomo26/models/CLS002_FOMO26_Infarct/sma_resunet_s_clsreg__3D/script=finetune_cls/root=base__stem=578257_last.ckpt/leaf=default_finetune_cls__clargs=data.fold=0,training.batch_size=2,training.epochs=50/split_80_10_10__fold=0/run_id=347680"
+CHECKPOINT_NAME = "best"
 
 
 def main(
