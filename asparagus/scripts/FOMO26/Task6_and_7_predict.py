@@ -9,8 +9,8 @@ from omegaconf import OmegaConf
 
 load_dotenv()
 
-MODEL_DIR = None
-CHECKPOINT_NAME = None
+MODEL_DIR = "/scratch/01/ahrasoulian/projects/fomo26/models/PT902_FOMO300K_HF/sma_resunet_s__3D/script=pretrain/root=lesion_impossible__stem=pretrain/leaf=projects/lesion_impossible/pretrain/sma_resunet_s_1.yaml__clargs=training.accumulate_grad_batches=1,training.batch_size=4,training.max_samples=1000000/split_99_01_00__fold=0/run_id=578257"
+CHECKPOINT_NAME = "last"
 
 
 def main(
@@ -22,6 +22,9 @@ def main(
     checkpoint_name: str,
     accelerator: str,
 ) -> None:
+    if not OmegaConf.has_resolver("eval"):
+        OmegaConf.register_new_resolver("eval", eval)
+
     ckpt_cfg = OmegaConf.load(os.path.join(checkpoint_dir, "hydra/config.yaml"))
     output_path = output_path
 
@@ -55,7 +58,7 @@ def main(
         return_predictions=True,
     )[0]
 
-    np.save(output_path, embeddings.view(-1).numpy())
+    np.save(output_path, embeddings.detach().cpu().reshape(-1).numpy())
 
     print(f"Test predictions saved to {output_path}")
 
