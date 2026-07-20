@@ -10,8 +10,8 @@ from omegaconf import OmegaConf
 load_dotenv()
 
 
-MODEL_DIR = None
-CHECKPOINT_NAME = None
+MODEL_DIR = "/scratch/01/ahrasoulian/projects/fomo26/models/SEG010_FOMO26_TrigeminalNeuralgia/sma_resunet_s__3D/script=finetune_seg/root=base__stem=578257_last.ckpt/leaf=default_finetune_seg__clargs=data.fold=0,training.batch_size=2,training.decoder_warmup_epochs=10,training.epochs=150,training.patch_size=[160,160,160],training.warmup_epochs=10/split_80_10_10__fold=0/run_id=763551"
+CHECKPOINT_NAME = "best"
 
 
 def main(
