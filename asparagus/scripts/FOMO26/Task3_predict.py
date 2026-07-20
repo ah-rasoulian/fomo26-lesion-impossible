@@ -9,8 +9,8 @@ from omegaconf import OmegaConf
 
 load_dotenv()
 
-MODEL_DIR = None
-CHECKPOINT_NAME = None
+MODEL_DIR = "/scratch/01/ahrasoulian/projects/fomo26/models/REGR002_FOMO26_BrainAge/sma_resunet_s_clsreg__3D/script=finetune_reg/root=base__stem=578257_last.ckpt/leaf=default_finetune_reg__clargs=data.fold=0,training.batch_size=2,training.epochs=50/split_80_10_10__fold=0/run_id=208931"
+CHECKPOINT_NAME = "best"
 
 
 def main(
