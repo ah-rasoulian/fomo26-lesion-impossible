@@ -1,6 +1,6 @@
 import logging
 import os
-from asparagus.modules.dataclasses import DataFiles
+from asparagus.modules.dataclasses import DataFiles, SubjectWiseDataFiles
 from asparagus.pipeline.auto_configuration.versioning import pathing, versioning
 from gardening_tools.functional.paths.read import load_json
 from hydra.utils import instantiate
@@ -16,6 +16,23 @@ def prepare_standard_experiment(cfg):
         test = load_json(cfg.test_split_path)
 
     filecfg = DataFiles(
+        dataset_json=load_json(pathingcfg.dataset_json_path),
+        splits=load_json(cfg.train_split_path)[cfg.data.fold],
+        test=test,
+    )
+    logging.warning(f"###RUN-ID={versioncfg.version}###")
+    return filecfg, pathingcfg, versioncfg
+
+def prepare_subjectwise_experiment(cfg):
+    pathingcfg = pathing(cfg, train=True)
+    versioncfg = versioning(cfg)
+    if not os.path.isfile(cfg.test_split_path):
+        logging.warn("No test split found")
+        test = None
+    else:
+        test = load_json(cfg.test_split_path)
+
+    filecfg = SubjectWiseDataFiles(
         dataset_json=load_json(pathingcfg.dataset_json_path),
         splits=load_json(cfg.train_split_path)[cfg.data.fold],
         test=test,
