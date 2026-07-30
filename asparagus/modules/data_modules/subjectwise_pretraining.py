@@ -1,7 +1,7 @@
 import lightning as pl
 import logging
 import torch.distributed as dist
-from asparagus.functional.collate import collate_return
+from asparagus.functional.collate import collate_return, subjectwise_pretrain_collate
 from asparagus.modules.datasets.SubjectWisePretrainDataset import SubjectWisePretrainDataset
 from asparagus.modules.datasets.TrainDataset import SingleSubjectPredictDataset
 from asparagus.modules.dataclasses.training import SubjectWiseDataFiles
@@ -19,7 +19,7 @@ class SubjectWisePretrainDataModule(pl.LightningDataModule):
         num_workers: int,
         train_split: list,
         val_split: list,
-        predict_samples: Optional[list] = [],
+        predict_samples: Optional[list] = None,
         train_transforms: Optional[Compose] = pretrain_CPU_train_transforms,
         val_transforms: Optional[Compose] = pretrain_CPU_val_transforms,
         predict_transforms: Optional[Compose] = None,
@@ -34,7 +34,7 @@ class SubjectWisePretrainDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.num_samples = num_samples
         self.predict_transforms = predict_transforms
-        self.predict_samples = predict_samples
+        self.predict_samples = predict_samples if predict_samples is not None else []
 
         logging.info(f"Using {self.num_workers} workers")
 
@@ -75,25 +75,22 @@ class SubjectWisePretrainDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=True if self.num_workers > 0 else False,
             drop_last=True,
             sampler=sampler,
+            collate_fn=subjectwise_pretrain_collate,
         )
 
     def val_dataloader(self):
-        sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
-        if dist.is_initialized():
-            sampler = DistributedSamplerWrapper(sampler)
-
         return DataLoader(
             self.val_dataset,
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             pin_memory=False,
             shuffle=False,
-            persistent_workers=True,
-            drop_last=True,
-            sampler=sampler,
+            persistent_workers=True if self.num_workers > 0 else False,
+            drop_last=False,
+            collate_fn=subjectwise_pretrain_collate,
         )
 
     def predict_dataloader(self):

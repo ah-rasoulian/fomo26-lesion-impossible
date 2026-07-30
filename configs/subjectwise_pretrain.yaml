@@ -1,0 +1,69 @@
+defaults:
+  - core/base@
+  - _self_
+
+task:
+root: base
+stem:
+
+model:
+  net: ${model.pretrain_net}
+  ckpt_every_n_epoch: 5
+
+lightning:
+  data_module: SubjectWisePretrainDataModule
+  lightning_module: BrainDinoModule
+
+data:
+  data_path: ${oc.env:ASPARAGUS_DATA}/${task}
+  train_split: split_99_01_00
+  fold: 0
+
+training:
+  source_patch_size: [ 160, 160, 160 ]
+  global_crop_size: [ 128, 128, 128 ]
+  local_crop_size: [ 64, 64, 64 ]
+  mask_ratio: 0.4
+  n_global_crops: 2
+  n_local_crops: 4
+
+  seed: ${random:0,1000000}
+
+  batch_size: 8
+  accumulate_grad_batches: 4
+
+  samples_per_epoch: 120_000
+  physical_global_batch_size: ${eval:"${training.batch_size} * ${hardware.num_devices} * ${hardware.num_nodes}"}
+  effective_global_batch_size: ${eval:"${training.physical_global_batch_size} * ${training.accumulate_grad_batches}"}
+
+  steps_per_epoch: ${eval:"ceil(${training.samples_per_epoch} / ${training.physical_global_batch_size})"}
+
+  max_samples: 20_000_000
+  steps: ${eval:"${training.max_samples} // ${training.effective_global_batch_size}"}
+
+  val_steps_per_epoch: 1.0
+  check_val_every_n_epoch: 1
+
+transforms:
+  cpu_tr_transforms: braindino_CPU_train_transforms
+  cpu_val_transforms: braindino_CPU_val_transforms
+  gpu_tr_transforms: braindino_GPU_train_transforms
+  gpu_val_transforms: braindino_GPU_val_transforms
+  normalize: True
+
+logger:
+  progress_bar: True
+  profile: False
+  wandb_log_model: False
+  wandb_logging: True
+  wandb_entity: ${oc.env:WANDB_ENTITY, "team-asparagus"}
+  wandb_project: Pretrain-ViT
+  mlflow_logging: False
+  log_every_n_steps: 50
+  log_images_every_n_epoch: 5
+  log_to_stdout: False
+
+profiler:
+  enabled: False
+  profile_every_n_steps: 500
+  warmup_steps: 10

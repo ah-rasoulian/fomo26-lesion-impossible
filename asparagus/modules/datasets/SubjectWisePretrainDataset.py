@@ -71,7 +71,7 @@ class SubjectWisePretrainDataset(Dataset):
         self,
         session_files: List[List[str]],
         transforms: Optional[torchvision.transforms.Compose] = None,
-        max_channels: int = 8,
+        max_channels: int = 4,
         modality_priority: Optional[List[int]] = None,
         is_validation: bool = False,
         affine_tolerance: float = 1e-3,

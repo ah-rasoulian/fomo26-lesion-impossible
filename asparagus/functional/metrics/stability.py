@@ -2,55 +2,85 @@
 Training stability and monitoring metrics for SSL pretraining.
 """
 
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, Optional
+
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+
+
+def _contains_nan(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isnan(value).any().item())
+
+    if isinstance(value, Mapping):
+        return any(_contains_nan(item) for item in value.values())
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_contains_nan(item) for item in value)
+
+    return False
+
+
+def _contains_inf(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isinf(value).any().item())
+
+    if isinstance(value, Mapping):
+        return any(_contains_inf(item) for item in value.values())
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_contains_inf(item) for item in value)
+
+    return False
 
 
 def compute_on_backward(model: nn.Module, grad_clip_val: Optional[float] = None) -> Dict[str, float]:
     """Metrics computed after backward pass."""
     return compute_gradient_metrics(model, grad_clip_val)
 
-
 def compute_nan_inf_metrics(
     loss: Optional[torch.Tensor] = None,
-    pred: Optional[torch.Tensor] = None,
-    activations: Optional[torch.Tensor] = None,
+    pred: Optional[Any] = None,
+    activations: Optional[Any] = None,
     model: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """
-    Numerical stability monitoring for gradient explosion/vanishing.
-    Any non-zero value indicates training instability requiring immediate attention.
+    Monitor tensors for NaN and Inf values.
+
+    `pred` and `activations` may be tensors or nested containers of tensors,
+    such as the per-crop outputs produced during DINO/iBOT pretraining.
     """
-    metrics = {}
+    metrics: Dict[str, float] = {}
 
-    # Check loss
     if loss is not None:
-        metrics["nan_loss"] = 1.0 if torch.isnan(loss).any().item() else 0.0
-        metrics["inf_loss"] = 1.0 if torch.isinf(loss).any().item() else 0.0
+        metrics["nan_loss"] = float(_contains_nan(loss))
+        metrics["inf_loss"] = float(_contains_inf(loss))
 
-    # Check predictions
     if pred is not None:
-        metrics["nan_predictions"] = 1.0 if torch.isnan(pred).any().item() else 0.0
-        metrics["inf_predictions"] = 1.0 if torch.isinf(pred).any().item() else 0.0
+        metrics["nan_predictions"] = float(_contains_nan(pred))
+        metrics["inf_predictions"] = float(_contains_inf(pred))
 
-    # Check activations
     if activations is not None:
-        metrics["nan_activations"] = 1.0 if torch.isnan(activations).any().item() else 0.0
-        metrics["inf_activations"] = 1.0 if torch.isinf(activations).any().item() else 0.0
+        metrics["nan_activations"] = float(_contains_nan(activations))
+        metrics["inf_activations"] = float(_contains_inf(activations))
 
-    # Check gradients
     if model is not None:
         has_nan_grad = False
         has_inf_grad = False
-        for p in model.parameters():
-            if p.grad is not None:
-                if torch.isnan(p.grad).any().item():
-                    has_nan_grad = True
-                if torch.isinf(p.grad).any().item():
-                    has_inf_grad = True
-        metrics["nan_gradients"] = 1.0 if has_nan_grad else 0.0
-        metrics["inf_gradients"] = 1.0 if has_inf_grad else 0.0
+
+        for parameter in model.parameters():
+            if parameter.grad is None:
+                continue
+
+            has_nan_grad |= _contains_nan(parameter.grad)
+            has_inf_grad |= _contains_inf(parameter.grad)
+
+            if has_nan_grad and has_inf_grad:
+                break
+
+        metrics["nan_gradients"] = float(has_nan_grad)
+        metrics["inf_gradients"] = float(has_inf_grad)
 
     return metrics
 

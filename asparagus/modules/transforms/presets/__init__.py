@@ -16,6 +16,13 @@ from .train import (
     none,
 )
 
+from .braindino_transforms import (
+    braindino_CPU_train_transforms,
+    braindino_CPU_val_transforms,
+    braindino_GPU_train_transforms,
+    braindino_GPU_val_transforms
+)
+
 __all__ = [
     "none",
     "CPU_clsreg_train_transforms_crop",
@@ -30,4 +37,8 @@ __all__ = [
     "pretrain_CPU_val_transforms",
     "pretrain_GPU_train_transforms",
     "pretrain_GPU_val_transforms",
+    "braindino_CPU_train_transforms",
+    "braindino_CPU_val_transforms",
+    "braindino_GPU_train_transforms",
+    "braindino_GPU_val_transforms",
 ]

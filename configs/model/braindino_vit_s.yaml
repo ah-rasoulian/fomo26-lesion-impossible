@@ -1,0 +1,26 @@
+defaults:
+  - core/braindino_vit@
+
+dimensions: 3D
+
+pretrain_net: pretrain_braindino_vit_s
+
+patch_kernel_size: 9
+patch_stride: 8
+patch_padding: 4
+
+init_sigma_mm: 4.0
+learn_sigma: True
+
+cls_projection_dim: 8192
+patch_projection_dim: 4096
+
+seg_net:
+cls_net:
+
+plugin_seg_net:
+plugin_seg_train_n_last_params:
+
+# Dropout rates (0.0 = no dropout)
+encoder_dropout_rate: 0.0
+decoder_dropout_rate: 0.0

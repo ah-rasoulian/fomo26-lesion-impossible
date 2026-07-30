@@ -1,5 +1,6 @@
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from typing import Any, Dict, List
+import torch
 
 
 def separate_encoder_decoder_weights(named_parameters) -> List[Dict[str, Any]]:
@@ -74,42 +75,98 @@ def sawtooth_warmup_cosine_decay_schedule(
 
 
 def simple_warmup_cosine_decay_schedule(
-    optimizer, warmup_epochs, steps_per_epoch, cosine_period_ratio, max_epochs=-1, max_steps=-1
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_ratio: float = 0.10,
+    cosine_period_ratio: float = 1.0,
+    minimum_lr: float = 1.0e-6,
 ):
     """
-    Phase 1: Warmup for both encoder and decoder
-    Phase 2: Cosine annealing for both
+    Step-based learning-rate schedule.
+
+    Phase 1:
+        Linear warmup from 1/1000 of the peak LR to the peak LR.
+
+    Phase 2:
+        Cosine decay from the peak LR to minimum_lr.
     """
-    assert warmup_epochs >= 0, "Warmup epochs must be greater than or equal to 0."
-    assert cosine_period_ratio > 0, "Cosine period ratio must be greater than 0."
-    assert steps_per_epoch > 0, "Steps per epoch must be greater than 0."
-    assert max_epochs > 0 or max_steps > 0, "Either max_epochs or max_steps must be greater than 0."
+    if total_steps <= 0:
+        raise ValueError(
+            f"total_steps must be positive, but received {total_steps}."
+        )
 
-    # cosine_half_period is from max to min
-    if max_epochs > 0:
-        max_steps = max_epochs * steps_per_epoch
+    if not 0.0 < warmup_ratio < 1.0:
+        raise ValueError(
+            "warmup_ratio must be strictly between 0 and 1."
+        )
 
-    total_warmup_steps = int(warmup_epochs * steps_per_epoch)
-    cosine_steps = int(cosine_period_ratio * (max_steps - total_warmup_steps))
+    if not 0.0 < cosine_period_ratio <= 1.0:
+        raise ValueError(
+            "cosine_period_ratio must be in the interval (0, 1]."
+        )
 
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps)
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=1.0 / 1000,
-        total_iters=total_warmup_steps,
+    warmup_steps = max(
+        1,
+        round(total_steps * warmup_ratio),
     )
 
-    print(f"Using warmup for {warmup_epochs} epochs ({total_warmup_steps} steps)")
-    print(f"Cosine decay for {cosine_steps} steps after warmup")
-    assert total_warmup_steps > 0, "Warmup steps must be greater than 0 for warmup schedule."
-    assert cosine_steps > 0, "Cosine steps must be greater than 0 for warmup cosine decay schedule."
+    remaining_steps = total_steps - warmup_steps
+    cosine_steps = max(
+        1,
+        round(remaining_steps * cosine_period_ratio),
+    )
+
+    peak_lrs = [
+        parameter_group["lr"]
+        for parameter_group in optimizer.param_groups
+    ]
+
+    if any(minimum_lr >= peak_lr for peak_lr in peak_lrs):
+        raise ValueError(
+            "minimum_lr must be smaller than every optimizer-group "
+            f"learning rate. Received minimum_lr={minimum_lr}, "
+            f"peak_lrs={peak_lrs}."
+        )
+
+    # CosineAnnealingLR uses one eta_min for all parameter groups.
+    # All current parameter groups have the same peak LR.
+    if len(set(peak_lrs)) != 1:
+        raise ValueError(
+            "This scheduler expects all parameter groups to have "
+            "the same peak learning rate."
+        )
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=1.0 / 1000.0,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=minimum_lr,
+    )
+
+    print("Learning-rate schedule configured as:")
+    print(f"  - Total optimizer steps: {total_steps:,}")
+    print(
+        f"  - Warmup: {warmup_steps:,} steps "
+        f"({warmup_steps / total_steps:.1%})"
+    )
+    print(f"  - Cosine decay: {cosine_steps:,} steps")
+    print(f"  - Peak learning rate: {peak_lrs[0]:.3e}")
+    print(f"  - Minimum learning rate: {minimum_lr:.3e}")
 
     return SequentialLR(
         optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[total_warmup_steps],
+        schedulers=[
+            warmup_scheduler,
+            cosine_scheduler,
+        ],
+        milestones=[warmup_steps],
     )
-
 
 def cosine_decay_schedule(optimizer, steps_per_epoch, cosine_period_ratio, max_epochs=-1, max_steps=-1):
     """

@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - /subjectwise_pretrain
+  - /model/braindino_vit_s@model
+  - /hardware/1node4gpus@hardware
+  - _self_
+
+task: PT902_FOMO300K_HF
+root: lesion_impossible
+stem: pretrain
+
+checkpoint_run_id:
