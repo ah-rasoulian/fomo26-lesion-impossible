@@ -3,6 +3,10 @@ import logging
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import wandb
+from lightning.pytorch.loggers import WandbLogger
+from torchvision.utils import make_grid
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -101,18 +105,21 @@ class BrainDinoModule(BaseModule):
             weights: Optional[dict] = None,
             dino_loss_weight: float = 1.0,
             ibot_loss_weight: float = 1.0,
-            region_loss_weight: float = 0.25,
-            koleo_loss_weight: float = 0.05,
+            region_loss_weight: float = 1.0,
+            koleo_loss_weight: float = 0.1,
             teacher_momentum: float = 0.994,
             teacher_momentum_final: float = 1.0,
             teacher_temperature: float = 0.07,
             teacher_warmup_temperature: float = 0.04,
-            teacher_temperature_warmup_epochs: int = 30,
             student_temperature: float = 0.1,
             center_momentum: float = 0.9,
             region_pool_size: Tuple[int, int, int] = (2, 2, 2),
             region_max_masked_fraction: float = 0.5,
             koleo_eps: float = 1e-8,
+
+            visual_log_every_n_steps: int = 10,
+            visual_log_max_channels: int = 3,
+            visual_log_sample_index: int = 0,
     ) -> None:
         super().__init__(
             model=model,
@@ -148,9 +155,7 @@ class BrainDinoModule(BaseModule):
         self.teacher_warmup_temperature = float(
             teacher_warmup_temperature
         )
-        self.teacher_temperature_warmup_epochs = int(
-            teacher_temperature_warmup_epochs
-        )
+
         self.student_temperature = float(student_temperature)
         self.center_momentum = float(center_momentum)
         self.region_pool_size = tuple(
@@ -160,6 +165,15 @@ class BrainDinoModule(BaseModule):
             region_max_masked_fraction
         )
         self.koleo_eps = float(koleo_eps)
+
+        self.visual_log_every_n_steps = int(visual_log_every_n_steps)
+        self.visual_log_max_channels = int(visual_log_max_channels)
+        self.visual_log_sample_index = int(visual_log_sample_index)
+
+        # Prevent duplicate logging during gradient accumulation.
+        self._last_visual_log_step = -1
+        # W&B visual metric definitions are initialized lazily.
+        self._wandb_visual_metrics_defined = False
 
         self._validate_hyperparameters()
 
@@ -206,10 +220,7 @@ class BrainDinoModule(BaseModule):
             raise ValueError(
                 "teacher_warmup_temperature must be positive."
             )
-        if self.teacher_temperature_warmup_epochs < 0:
-            raise ValueError(
-                "teacher_temperature_warmup_epochs must be non-negative."
-            )
+
         if self.student_temperature <= 0.0:
             raise ValueError("student_temperature must be positive.")
         if not 0.0 <= self.center_momentum < 1.0:
@@ -248,6 +259,40 @@ class BrainDinoModule(BaseModule):
                 f"Received minimum_lr={self.minimum_lr} and "
                 f"learning_rate={self.learning_rate}."
             )
+
+        if self.visual_log_every_n_steps < 0:
+            raise ValueError(
+                "visual_log_every_n_steps must be non-negative."
+            )
+
+        if self.visual_log_max_channels <= 0:
+            raise ValueError(
+                "visual_log_max_channels must be positive."
+            )
+
+        if self.visual_log_sample_index < 0:
+            raise ValueError(
+                "visual_log_sample_index must be non-negative."
+            )
+
+    def _total_optimizer_steps(self) -> int:
+        """
+        Return the configured number of optimizer updates.
+
+        Lightning's max_steps/global_step count optimizer updates, so gradient
+        accumulation is already accounted for.
+        """
+        total_steps = self.trainer.max_steps
+
+        if total_steps is None or total_steps <= 0:
+            total_steps = self.trainer.estimated_stepping_batches
+
+        if total_steps is None or total_steps <= 0:
+            raise RuntimeError(
+                "Could not determine the total number of optimizer steps."
+            )
+
+        return int(total_steps)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -967,32 +1012,19 @@ class BrainDinoModule(BaseModule):
         return student_global, student_local, teacher_global
 
     def current_teacher_temperature(self) -> float:
-        if self.teacher_temperature_warmup_epochs == 0:
-            return self.teacher_temperature
+        total_steps = self._total_optimizer_steps()
+        warmup_steps = max(int(round(total_steps * self.warmup_ratio)), 1)
 
-        progress = min(
-            float(self.current_epoch)
-            / float(self.teacher_temperature_warmup_epochs),
-            1.0,
-        )
-        return (
-            self.teacher_warmup_temperature
-            + progress
-            * (
-                self.teacher_temperature
-                - self.teacher_warmup_temperature
-            )
-        )
+        progress = min(float(self.global_step) / float(warmup_steps), 1.0)
+        return self.teacher_warmup_temperature + progress * (self.teacher_temperature - self.teacher_warmup_temperature)
 
     def current_teacher_momentum(self) -> float:
-        total_steps = max(int(self.trainer.estimated_stepping_batches), 1)
+        total_steps = self._total_optimizer_steps()
+
         progress = min(float(self.global_step) / float(total_steps), 1.0)
         cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
-        return (
-            self.teacher_momentum
-            + cosine_progress
-            * (self.teacher_momentum_final - self.teacher_momentum)
-        )
+
+        return self.teacher_momentum + cosine_progress * (self.teacher_momentum_final - self.teacher_momentum)
 
     @torch.no_grad()
     def update_teacher(self) -> None:
@@ -1160,6 +1192,20 @@ class BrainDinoModule(BaseModule):
                 batch_size=batch_size,
             )
 
+            self.log_dict(
+                self._compute_ssl_progress_metrics(
+                    batch=batch,
+                    student_global=student_global,
+                    teacher_global=teacher_global,
+                ),
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+
+        self._log_wandb_visuals(
+            batch=batch,
+            student_global=student_global,
+        )
         return loss
 
     @torch.no_grad()
@@ -1342,17 +1388,7 @@ class BrainDinoModule(BaseModule):
                 f"Unknown optimizer: {self.optimizer}"
             )
 
-        # max_steps counts optimizer updates. Lightning already accounts for
-        # gradient accumulation when enforcing max_steps.
-        total_steps = self.trainer.max_steps
-
-        if total_steps is None or total_steps <= 0:
-            total_steps = self.trainer.estimated_stepping_batches
-
-        if total_steps is None or total_steps <= 0:
-            raise ValueError(
-                "Could not determine the total number of optimizer steps."
-            )
+        total_steps = self._total_optimizer_steps()
 
         scheduler = simple_warmup_cosine_decay_schedule(
             optimizer=optimizer,
@@ -1369,4 +1405,387 @@ class BrainDinoModule(BaseModule):
                 "interval": "step",
                 "frequency": 1,
             },
+        }
+
+    def _define_wandb_visual_metrics(self) -> None:
+        if self._wandb_visual_metrics_defined:
+            return
+
+        if not self.trainer.is_global_zero:
+            return
+
+        wandb_logger = self.get_logger_by_class_name("WandbLogger")
+        if wandb_logger is None:
+            return
+
+        run = wandb_logger.experiment
+
+        run.define_metric("visuals/global_step", hidden=True)
+        run.define_metric("visuals/*", step_metric="visuals/global_step")
+
+        self._wandb_visual_metrics_defined = True
+
+    @staticmethod
+    def _normalize_slice(image: torch.Tensor) -> torch.Tensor:
+        image = image.float()
+
+        finite = torch.isfinite(image)
+        if not finite.any():
+            return torch.zeros_like(image)
+
+        values = image[finite]
+        lower = torch.quantile(values, 0.01)
+        upper = torch.quantile(values, 0.99)
+
+        if upper <= lower:
+            return torch.zeros_like(image)
+
+        return (image.clamp(lower, upper) - lower) / (upper - lower)
+
+    @classmethod
+    def _volume_montage(
+            cls,
+            volume: torch.Tensor,
+            mask_volume: Optional[torch.Tensor] = None,
+            panel_size: tuple[int, int] = (192, 192),
+    ) -> torch.Tensor:
+        """
+        Convert [D, H, W] into an RGB montage containing central
+        axial, coronal, and sagittal slices.
+        """
+        if volume.ndim != 3:
+            raise ValueError(
+                f"Expected [D, H, W], got {tuple(volume.shape)}."
+            )
+
+        depth, height, width = volume.shape
+
+        slices = [
+            volume[depth // 2, :, :],
+            volume[:, height // 2, :],
+            volume[:, :, width // 2],
+        ]
+
+        if mask_volume is None:
+            mask_slices = [None, None, None]
+        else:
+            mask_slices = [
+                mask_volume[depth // 2, :, :],
+                mask_volume[:, height // 2, :],
+                mask_volume[:, :, width // 2],
+            ]
+
+        panels = []
+
+        for image_slice, mask_slice in zip(slices, mask_slices, ):
+            normalized = cls._normalize_slice(image_slice)
+
+            normalized = F.interpolate(
+                normalized[None, None],
+                size=panel_size,
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+
+            rgb = normalized.unsqueeze(0).repeat(3, 1, 1)
+
+            if mask_slice is not None:
+                overlay = F.interpolate(
+                    mask_slice.float()[None, None],
+                    size=panel_size,
+                    mode="nearest",
+                )[0, 0].bool()
+
+                rgb[0, overlay] = 1.0
+                rgb[1, overlay] *= 0.25
+                rgb[2, overlay] *= 0.25
+
+            panels.append(rgb.cpu())
+
+        return make_grid(panels, nrow=3, padding=4, normalize=False, pad_value=1.0)
+
+    @staticmethod
+    def _mask_to_volume(
+            mask: torch.Tensor,
+            patch_grid_shape: Sequence[int],
+            spatial_shape: Sequence[int],
+    ) -> torch.Tensor:
+        """
+        Convert a flattened token mask [N] to a voxel-resolution mask
+        [D, H, W] for visualization.
+        """
+        patch_grid_shape = tuple(int(value) for value in patch_grid_shape)
+
+        expected_tokens = math.prod(patch_grid_shape)
+        if mask.numel() != expected_tokens:
+            raise ValueError(
+                f"Mask size does not match patch_grid_shape: {mask.numel()} versus {patch_grid_shape}."
+            )
+
+        token_mask = mask.reshape(1, 1, *patch_grid_shape).float()
+
+        voxel_mask = F.interpolate(
+            token_mask,
+            size=tuple(int(value) for value in spatial_shape),
+            mode="nearest",
+        )
+
+        return voxel_mask[0, 0].bool()
+
+    @staticmethod
+    def _binary_mask_montage(
+            mask_volume: torch.Tensor,
+            panel_size: tuple[int, int] = (192, 192),
+    ) -> torch.Tensor:
+        """
+        Create an RGB montage of the central axial, coronal, and
+        sagittal slices of a binary voxel mask.
+        """
+        if mask_volume.ndim != 3:
+            raise ValueError(
+                f"Expected [D, H, W], got {tuple(mask_volume.shape)}."
+            )
+
+        depth, height, width = mask_volume.shape
+
+        mask_slices = [
+            mask_volume[depth // 2, :, :],
+            mask_volume[:, height // 2, :],
+            mask_volume[:, :, width // 2],
+        ]
+
+        panels = []
+
+        for mask_slice in mask_slices:
+            resized = F.interpolate(
+                mask_slice.float()[None, None],
+                size=panel_size,
+                mode="nearest",
+            )[0, 0]
+
+            rgb = resized.unsqueeze(0).repeat(3, 1, 1)
+            panels.append(rgb.cpu())
+
+        return make_grid(
+            panels,
+            nrow=3,
+            padding=4,
+            normalize=False,
+            pad_value=1.0,
+        )
+
+    @classmethod
+    def _global_mask_comparison(
+            cls,
+            volume: torch.Tensor,
+            mask_volume: torch.Tensor,
+            panel_size: tuple[int, int] = (192, 192),
+    ) -> torch.Tensor:
+        """
+        Create a vertical comparison:
+
+            Row 1: original axial, coronal, sagittal slices
+            Row 2: the same slices with masked tokens highlighted
+            Row 3: the binary token mask
+        """
+        original = cls._volume_montage(
+            volume=volume,
+            panel_size=panel_size,
+        )
+
+        overlay = cls._volume_montage(
+            volume=volume,
+            mask_volume=mask_volume,
+            panel_size=panel_size,
+        )
+
+        binary_mask = cls._binary_mask_montage(
+            mask_volume=mask_volume,
+            panel_size=panel_size,
+        )
+
+        return make_grid(
+            [original, overlay, binary_mask],
+            nrow=1,
+            padding=8,
+            normalize=False,
+            pad_value=1.0,
+        )
+
+    @torch.no_grad()
+    def _log_wandb_visuals(
+            self,
+            batch: Mapping[str, Any],
+            student_global: Sequence[ModelOutput],
+    ) -> None:
+        if not self.trainer.is_global_zero:
+            return
+
+        if self.visual_log_every_n_steps == 0:
+            return
+
+        step = int(self.global_step)
+
+        # Avoid duplicate logs across gradient-accumulation microbatches.
+        if step == self._last_visual_log_step:
+            return
+
+        if step % self.visual_log_every_n_steps != 0:
+            return
+
+        wandb_logger = self.get_logger_by_class_name("WandbLogger")
+        if wandb_logger is None:
+            return
+
+        self._define_wandb_visual_metrics()
+
+        global_crops = batch["global_crops"]
+        teacher_global_crops = batch["teacher_global_crops"]
+        local_crops = batch.get("local_crops", [])
+        global_masks = batch["global_masks"]
+
+        sample_index = self.visual_log_sample_index
+        batch_size = global_crops[0].shape[0]
+
+        if sample_index >= batch_size:
+            return
+
+        teacher_images = []
+        global_comparison_images = []
+        local_images = []
+
+        def add_crop(
+                destination: list,
+                crop: torch.Tensor,
+                view_name: str,
+        ) -> None:
+            sample = crop[sample_index].detach()
+            number_channels = min(sample.shape[0], self.visual_log_max_channels)
+
+            for channel_index in range(number_channels):
+                montage = self._volume_montage(volume=sample[channel_index])
+
+                destination.append(
+                    wandb.Image(
+                        montage,
+                        caption=(
+                            f"view={view_name} | "
+                            f"channel={channel_index} | "
+                            f"sample={sample_index} | "
+                            f"optimizer_step={step}"
+                        ),
+                    )
+                )
+
+        # Teacher global crops are useful for checking teacher preprocessing.
+        for view_index, crop in enumerate(teacher_global_crops):
+            add_crop(
+                destination=teacher_images,
+                crop=crop,
+                view_name=f"teacher_global_{view_index}",
+            )
+
+        # Combine original, mask overlay, and binary mask in one image.
+        for view_index, crop in enumerate(global_crops):
+            sample = crop[sample_index].detach()
+
+            mask_volume = self._mask_to_volume(
+                mask=global_masks[view_index][sample_index],
+                patch_grid_shape=student_global[
+                    view_index
+                ]["patch_grid_shape"],
+                spatial_shape=crop.shape[-3:],
+            )
+
+            number_channels = min(sample.shape[0], self.visual_log_max_channels)
+
+            for channel_index in range(number_channels):
+                comparison = self._global_mask_comparison(
+                    volume=sample[channel_index],
+                    mask_volume=mask_volume,
+                )
+
+                global_comparison_images.append(
+                    wandb.Image(
+                        comparison,
+                        caption=(
+                            f"global_view={view_index} | "
+                            f"channel={channel_index} | "
+                            f"sample={sample_index} | "
+                            f"optimizer_step={step} | "
+                            "rows=original, mask_overlay, binary_mask"
+                        ),
+                    )
+                )
+
+        # Local crops do not have iBOT masks.
+        for view_index, crop in enumerate(local_crops):
+            add_crop(
+                destination=local_images,
+                crop=crop,
+                view_name=f"student_local_{view_index}",
+            )
+
+        visual_data = {"visuals/global_step": step}
+
+        if global_comparison_images:
+            visual_data["visuals/global_mask_comparison"] = global_comparison_images
+
+        if teacher_images:
+            visual_data["visuals/teacher_global"] = teacher_images
+
+        if local_images:
+            visual_data["visuals/student_local"] = local_images
+
+        wandb_logger.experiment.log(visual_data, commit=True,)
+
+        self._last_visual_log_step = step
+
+    @torch.no_grad()
+    def _compute_ssl_progress_metrics(
+            self,
+            batch: Mapping[str, Any],
+            student_global: Sequence[ModelOutput],
+            teacher_global: Sequence[ModelOutput],
+    ) -> Dict[str, torch.Tensor]:
+        """
+            cls_feature_std approaching zero indicates collapse.
+            mean_pairwise_cosine approaching 1.0 indicates all samples are becoming nearly identical.
+            teacher_student_cosine should generally increase, but instantly reaching almost 1.0 alongside low feature standard is suspicious.
+            Center norms should remain finite and change smoothly.
+            mask_ratio verifies that the intended masking configuration reaches the loss.
+        """
+        student_cls = torch.cat([output["cls_features"].float() for output in student_global], dim=0)
+        teacher_cls = torch.cat([output["cls_features"].float() for output in teacher_global], dim=0)
+
+        student_normalized = F.normalize(student_cls, dim=-1)
+        teacher_normalized = F.normalize(teacher_cls, dim=-1)
+
+        feature_std = student_cls.std(dim=0).mean()
+
+        centered = student_cls - student_cls.mean(dim=0)
+        feature_rms = centered.square().mean().sqrt()
+
+        if student_normalized.shape[0] > 1:
+            similarity = (student_normalized @ student_normalized.transpose(0, 1))
+            off_diagonal = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
+            mean_pairwise_cosine = similarity[off_diagonal].mean()
+        else:
+            mean_pairwise_cosine = student_cls.new_tensor(0.0)
+
+        matched_student = torch.stack([output["cls_features"].float() for output in student_global], dim=0)
+        matched_teacher = torch.stack([output["cls_features"].float() for output in teacher_global], dim=0)
+
+        teacher_student_cosine = F.cosine_similarity(matched_student, matched_teacher, dim=-1).mean()
+
+        mask_ratio = torch.cat([mask.float().reshape(-1) for mask in batch["global_masks"]]).mean()
+
+        return {
+            "ssl_progress/cls_feature_std": feature_std,
+            "ssl_progress/cls_feature_rms": feature_rms,
+            "ssl_progress/mean_pairwise_cosine": mean_pairwise_cosine,
+            "ssl_progress/teacher_student_cosine": teacher_student_cosine,
+            "ssl_progress/mask_ratio": mask_ratio,
+            "ssl_progress/dino_center_norm": self.dino_center.float().norm(),
+            "ssl_progress/ibot_center_norm": self.ibot_center.float().norm(),
         }

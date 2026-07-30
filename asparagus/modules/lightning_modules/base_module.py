@@ -305,3 +305,19 @@ class BaseModule(L.LightningModule):
         if isinstance(self.unwrap_compiled_model(), SpacingModalityResidualEncoderUNetCLSREG) or isinstance(self.unwrap_compiled_model(), SpacingModalityResidualEncoderUNet):
             return True
         return False
+
+    def get_logger_by_class_name(
+            self,
+            class_name: str,
+    ):
+        """
+        Return the first configured Lightning logger matching `class_name`.
+        """
+        if self.trainer is None:
+            return None
+
+        for logger in self.trainer.loggers:
+            if class_name in logger.__class__.__name__:
+                return logger
+
+        return None
