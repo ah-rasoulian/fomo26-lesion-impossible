@@ -338,28 +338,143 @@ class BrainDinoViewTransform:
 
         return view.contiguous()
 
-    def _make_mask(self, batch_size: int, device: torch.device, mask_index: int = 0) -> torch.Tensor:
-        number_of_tokens = math.prod(self.global_token_grid)
-        number_masked = round(self.mask_ratio * number_of_tokens)
-        mask = torch.zeros(
-            (batch_size, number_of_tokens), dtype=torch.bool, device=device
+    @staticmethod
+    def _make_3d_block_mask(
+            grid_shape: tuple[int, int, int],
+            number_masked: int,
+            device: torch.device,
+            generator: torch.Generator,
+            min_block_fraction: float = 0.05,
+            max_block_fraction: float = 0.25,
+            max_attempts: int = 100,
+    ) -> torch.Tensor:
+        """
+        Create a mask as a union of randomly positioned 3D cuboids.
+
+        The final mask contains exactly `number_masked` tokens.
+        """
+        height, width, depth = grid_shape
+        number_of_tokens = height * width * depth
+
+        mask = torch.zeros(grid_shape, dtype=torch.bool, device=device)
+
+        min_block_volume = max(1, round(min_block_fraction * number_of_tokens))
+        max_block_volume = max(min_block_volume, round(max_block_fraction * number_of_tokens))
+
+        masked_count = 0
+        attempts = 0
+
+        while masked_count < number_masked and attempts < max_attempts:
+            attempts += 1
+            remaining = number_masked - masked_count
+
+            target_volume = int(
+                torch.randint(
+                    low=min(min_block_volume, remaining),
+                    high=min(max_block_volume, remaining) + 1,
+                    size=(1,),
+                    generator=generator,
+                    device=device,
+                ).item()
+            )
+
+            # Sample a 3D block shape around the desired volume.
+            block_height = int(
+                torch.randint(1, min(height, target_volume) + 1, (1,), generator=generator, device=device).item()
+            )
+            remaining_area = max(1, math.ceil(target_volume / block_height))
+
+            block_width = int(
+                torch.randint(1, min(width, remaining_area) + 1, (1,), generator=generator, device=device).item()
+            )
+
+            block_depth = min(depth, max(1, math.ceil(target_volume / (block_width * block_height))))
+
+            start_height = int(
+                torch.randint(0, height - block_height + 1, (1,), generator=generator, device=device, ).item()
+            )
+            start_width = int(
+                torch.randint(0, width - block_width + 1, (1,), generator=generator, device=device, ).item()
+            )
+            start_depth = int(
+                torch.randint(0, depth - block_depth + 1, (1,), generator=generator, device=device).item()
+            )
+
+            block = mask[
+                start_height:start_height + block_height,
+                start_width:start_width + block_width,
+                start_depth:start_depth + block_depth,
+            ]
+
+            available = (~block).nonzero(as_tuple=False)
+
+            if available.numel() == 0:
+                continue
+
+            number_to_add = min(remaining, available.shape[0])
+
+            # Randomly trim the last block to preserve the exact mask ratio.
+            selected = available[
+                torch.randperm(available.shape[0], generator=generator, device=device)[:number_to_add]
+            ]
+
+            block[selected[:, 0], selected[:, 1], selected[:, 2]] = True
+            masked_count += number_to_add
+
+        # Extremely unlikely fallback if repeated block overlap prevented completion.
+        if masked_count < number_masked:
+            unmasked = (~mask).flatten().nonzero(as_tuple=False).squeeze(1)
+            number_to_add = number_masked - masked_count
+
+            selected = unmasked[
+                torch.randperm(unmasked.numel(), generator=generator, device=device)[:number_to_add]
+            ]
+            mask.flatten()[selected] = True
+
+        return mask
+
+    def _make_mask(
+            self,
+            batch_size: int,
+            device: torch.device,
+            mask_index: int = 0,
+    ) -> torch.Tensor:
+        """
+        Generate block-based iBOT masks over a 3D token grid.
+
+        Returns:
+            Boolean mask with shape [B, N], where N = H * W * D.
+        """
+        grid_shape = tuple(self.global_token_grid)
+        number_of_tokens = math.prod(grid_shape)
+        number_masked = min(
+            round(self.mask_ratio * number_of_tokens),
+            number_of_tokens,
         )
 
         if number_masked == 0:
-            return mask
+            return torch.zeros((batch_size, number_of_tokens), dtype=torch.bool, device=device)
 
-        if self.training:
-            scores = torch.rand((batch_size, number_of_tokens), device=device)
-            indices = scores.topk(number_masked, dim=1, largest=False).indices
-        else:
+        masks = []
+        for sample_index in range(batch_size):
             generator = torch.Generator(device=device)
-            generator.manual_seed(12_345 + mask_index)
 
-            permutation = torch.randperm(number_of_tokens, generator=generator, device=device)
-            indices = permutation[:number_masked]
-            indices = indices.unsqueeze(0).expand(batch_size, -1)
+            if self.training:
+                # Different seed for each invocation and sample.
+                generator.seed()
+            else:
+                # Reproducible validation masks, but not identical across samples.
+                generator.manual_seed(12_345 + mask_index * batch_size + sample_index)
 
-        return mask.scatter_(1, indices, True)
+            sample_mask = self._make_3d_block_mask(
+                grid_shape=grid_shape,
+                number_masked=number_masked,
+                device=device,
+                generator=generator,
+            )
+            masks.append(sample_mask.flatten())
+
+        return torch.stack(masks, dim=0)
 
     def _augment_student_info(
             self,
