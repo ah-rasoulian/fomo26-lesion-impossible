@@ -20,9 +20,9 @@ data:
   fold: 0
 
 training:
-  source_patch_size: [ 192, 192, 192 ]
-  global_crop_size: [ 144, 144, 144 ]
-  local_crop_size: [ 72, 72, 72 ]
+  source_patch_size: [ 160, 160, 160 ]
+  global_crop_size: [ 128, 128, 128 ]
+  local_crop_size: [ 64, 64, 64 ]
 
   mask_ratio: 0.4
   n_global_crops: 2
@@ -39,7 +39,7 @@ training:
 
   steps_per_epoch: ${ceil_div:${training.samples_per_epoch},${training.physical_global_batch_size}}
 
-  max_samples: 24_000_000
+  max_samples: 16_000_000
   steps: ${eval:"${training.max_samples} // ${training.effective_global_batch_size}"}
 
   val_steps_per_epoch: 1.0
