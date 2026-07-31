@@ -32,7 +32,7 @@ def _clone_metadata(info: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _pad_to_shape(x: torch.Tensor, target: SpatialShape) -> torch.Tensor:
-    """Symmetrically pad [B, C, D, H, W] to at least target."""
+    """Symmetrically pad [B, C, H, W, D] to at least target."""
     current = x.shape[-3:]
     padding = []
     for size, wanted in reversed(tuple(zip(current, target))):
@@ -48,7 +48,7 @@ def _crop(
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """
-    Crop [B, C, D, H, W] independently for each subject.
+    Crop [B, C, H, W, D] independently for each subject.
 
     All channels belonging to one subject receive the same crop because they
     are spatially aligned modalities. Different subjects receive independent
@@ -58,7 +58,7 @@ def _crop(
     """
     if x.ndim != 5:
         raise ValueError(
-            "Expected x with shape [B, C, D, H, W], "
+            "Expected x with shape [B, C, H, W, D], "
             f"but received {tuple(x.shape)}."
         )
 
@@ -73,14 +73,14 @@ def _crop(
             for size, crop_size in zip(spatial_shape, crop_shape)
         ]
 
-        d, h, w = starts
-        cd, ch, cw = crop_shape
+        h, w, d = starts
+        ch, cw, cd = crop_shape
 
         return x[
             ...,
-            d : d + cd,
             h : h + ch,
             w : w + cw,
+            d : d + cd,
         ]
 
     maximum_starts = [
@@ -105,16 +105,16 @@ def _crop(
         for maximum in maximum_starts
     ]
 
-    depth_starts, height_starts, width_starts = starts
-    cd, ch, cw = crop_shape
+    height_starts, width_starts, depth_starts = starts
+    ch, cw, cd = crop_shape
 
     crops = [
         x[
             batch_index,
             :,
-            depth_starts[batch_index] : depth_starts[batch_index] + cd,
             height_starts[batch_index] : height_starts[batch_index] + ch,
             width_starts[batch_index] : width_starts[batch_index] + cw,
+            depth_starts[batch_index] : depth_starts[batch_index] + cd,
         ]
         for batch_index in range(batch_size)
     ]
@@ -134,9 +134,12 @@ class BrainDinoIntensityAugmentation:
     noise_probability: float = 0.2
     noise_std: float = 0.05
     gamma_probability: float = 0.2
-    gamma_range: Tuple[float, float] = (0.7, 1.5)
+    gamma_range: Tuple[float, float] = (0.8, 1.25)
     bias_probability: float = 0.2
     bias_strength: float = 0.25
+    scale_shift_probability: float = 0.2
+    scale_range: Tuple[float, float] = (0.9, 1.1)
+    shift_range: Tuple[float, float] = (-0.1, 0.1)
 
     def __call__(
             self,
@@ -144,7 +147,7 @@ class BrainDinoIntensityAugmentation:
             channel_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if x.ndim != 5:
-            raise ValueError("Expected image with shape [B, C, D, H, W].")
+            raise ValueError("Expected image with shape [B, C, H, W, D].")
 
         batch_channels = x.shape[:2]
         device = x.device
@@ -192,6 +195,20 @@ class BrainDinoIntensityAugmentation:
             ).exp()
             x = torch.where(apply, x * field, x)
 
+        if self.scale_shift_probability > 0:
+            apply = (
+                torch.rand((*batch_channels, 1, 1, 1), device=device)
+                < self.scale_shift_probability
+            )
+            scale = torch.empty(
+                (*batch_channels, 1, 1, 1), device=device, dtype=dtype
+            ).uniform_(*self.scale_range)
+            shift = torch.empty(
+                (*batch_channels, 1, 1, 1), device=device, dtype=dtype
+            ).uniform_(*self.shift_range)
+            augmented = x * scale + shift
+            x = torch.where(apply, augmented, x)
+
         if channel_mask is not None:
             if channel_mask.shape != x.shape[:2]:
                 raise ValueError(
@@ -212,15 +229,15 @@ class BrainDinoViewTransform:
 
     Input:
         {
-            "image": Tensor[B, C, D, H, W],
+            "image": Tensor[B, C, H, W, D],
             "info": {"spacing": Tensor[B, 3], "modality": Tensor[B, C], ...},
             ...
         }
 
     Output:
         {
-            "global_crops": list[Tensor[B, C, Dg, Hg, Wg]],
-            "local_crops": list[Tensor[B, C, Dl, Hl, Wl]],
+            "global_crops": list[Tensor[B, C, Hg, Wg, Dg]],
+            "local_crops": list[Tensor[B, C, Hl, Wl, Dl]],
             "global_masks": list[BoolTensor[B, N]],
             "global_info": list[dict],
             "local_info": list[dict],
@@ -237,7 +254,12 @@ class BrainDinoViewTransform:
         n_local_crops: int = 4,
         mask_ratio: float = 0.5,
         training: bool = True,
-        flip_probability: float = 0.5,
+        flip_probability: float = 0.0,
+        flip_axes_hwd: Sequence[int] = (0, 1, 2),
+        affine_probability: float = 0.4,
+        rotation_degrees: float = 10.0,
+        scale_range: Tuple[float, float] = (0.9, 1.1),
+        translation_fraction: float = 0.05,
         intensity_augmentation: Optional[BrainDinoIntensityAugmentation] = None,
         channel_drop_probability: float = 0.25,
         one_unknown_probability: float = 0.20,
@@ -254,6 +276,25 @@ class BrainDinoViewTransform:
             raise ValueError("n_local_crops cannot be negative.")
         if not 0.0 <= mask_ratio <= 1.0:
             raise ValueError("mask_ratio must be in [0, 1].")
+        for name, probability in (
+            ("flip_probability", flip_probability),
+            ("affine_probability", affine_probability),
+        ):
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1].")
+        flip_axes_hwd = tuple(int(axis) for axis in flip_axes_hwd)
+        if not flip_axes_hwd or any(axis not in (0, 1, 2) for axis in flip_axes_hwd):
+            raise ValueError("flip_axes_hwd must contain axes from (0, 1, 2) = (H, W, D).")
+        if rotation_degrees < 0:
+            raise ValueError("rotation_degrees cannot be negative.")
+        if (
+            len(scale_range) != 2
+            or scale_range[0] <= 0
+            or scale_range[0] > scale_range[1]
+        ):
+            raise ValueError("scale_range must be two ordered positive values.")
+        if not 0.0 <= translation_fraction <= 1.0:
+            raise ValueError("translation_fraction must be in [0, 1].")
 
         for crop_size, stride in zip(self.global_crop_size, self.token_stride):
             if crop_size % stride:
@@ -267,6 +308,11 @@ class BrainDinoViewTransform:
         self.mask_ratio = mask_ratio
         self.training = training
         self.flip_probability = flip_probability
+        self.flip_axes_hwd = flip_axes_hwd
+        self.affine_probability = affine_probability
+        self.rotation_degrees = rotation_degrees
+        self.scale_range = tuple(float(v) for v in scale_range)
+        self.translation_fraction = translation_fraction
         self.intensity_augmentation = (
             intensity_augmentation
             if intensity_augmentation is not None
@@ -303,6 +349,7 @@ class BrainDinoViewTransform:
             image: torch.Tensor,
             shape: SpatialShape,
             channel_mask: torch.Tensor,
+            spacing_hwd: torch.Tensor,
     ) -> torch.Tensor:
         view = _crop(
             image,
@@ -311,20 +358,25 @@ class BrainDinoViewTransform:
         )
 
         if self.training:
-            for dimension in (-3, -2, -1):
-                flip_samples = (
-                        torch.rand(
-                            view.shape[0],
-                            device=view.device,
-                        )
-                        < self.flip_probability
-                )
+            view = self._random_spatial_affine(view, spacing_hwd)
 
-                if flip_samples.any():
-                    view[flip_samples] = torch.flip(
-                        view[flip_samples],
-                        dims=(dimension,),
-                    )
+            flip_samples = (
+                torch.rand(view.shape[0], device=view.device)
+                < self.flip_probability
+            )
+            if flip_samples.any():
+                selected_axes = torch.randint(
+                    len(self.flip_axes_hwd),
+                    (view.shape[0],),
+                    device=view.device,
+                )
+                for option, axis_hwd in enumerate(self.flip_axes_hwd):
+                    selected = flip_samples & (selected_axes == option)
+                    if selected.any():
+                        view[selected] = torch.flip(
+                            view[selected],
+                            dims=(axis_hwd + 2,),
+                        )
 
             view = self.intensity_augmentation(
                 view,
@@ -337,6 +389,120 @@ class BrainDinoViewTransform:
         ].to(device=view.device, dtype=view.dtype)
 
         return view.contiguous()
+
+    def _random_spatial_affine(
+            self,
+            x_hwd: torch.Tensor,
+            spacing_hwd: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply one independently sampled, spacing-aware 3D affine per subject.
+
+        The same transform is applied to every channel of a subject, preserving
+        alignment between modalities. Public tensors use [B,C,H,W,D]. PyTorch
+        grid_sample requires [B,C,D,H,W], so permutation is explicit here.
+        spacing_hwd is reordered to grid coordinates (W,H,D).
+        """
+        batch_size = x_hwd.shape[0]
+        device = x_hwd.device
+        work_dtype = torch.float32
+
+        apply = (
+            torch.rand(batch_size, device=device)
+            < self.affine_probability
+        )
+        if not apply.any():
+            return x_hwd
+
+        maximum_angle = math.radians(self.rotation_degrees)
+        angles = torch.empty(
+            (batch_size, 3), device=device, dtype=work_dtype
+        ).uniform_(-maximum_angle, maximum_angle)
+        scales = torch.empty(
+            batch_size, device=device, dtype=work_dtype
+        ).uniform_(*self.scale_range)
+
+        # A displacement of f of the image extent is 2f in normalized
+        # affine_grid coordinates, whose full range is [-1, 1].
+        translations = torch.empty(
+            (batch_size, 3), device=device, dtype=work_dtype
+        ).uniform_(
+            -2.0 * self.translation_fraction,
+            2.0 * self.translation_fraction,
+        )
+
+        ax, ay, az = angles.unbind(dim=1)
+        cx, cy, cz = ax.cos(), ay.cos(), az.cos()
+        sx, sy, sz = ax.sin(), ay.sin(), az.sin()
+
+        rotation_x = torch.zeros(
+            (batch_size, 3, 3), device=device, dtype=work_dtype
+        )
+        rotation_x[:, 0, 0] = 1
+        rotation_x[:, 1, 1] = cx
+        rotation_x[:, 1, 2] = -sx
+        rotation_x[:, 2, 1] = sx
+        rotation_x[:, 2, 2] = cx
+
+        rotation_y = torch.zeros_like(rotation_x)
+        rotation_y[:, 0, 0] = cy
+        rotation_y[:, 0, 2] = sy
+        rotation_y[:, 1, 1] = 1
+        rotation_y[:, 2, 0] = -sy
+        rotation_y[:, 2, 2] = cy
+
+        rotation_z = torch.zeros_like(rotation_x)
+        rotation_z[:, 0, 0] = cz
+        rotation_z[:, 0, 1] = -sz
+        rotation_z[:, 1, 0] = sz
+        rotation_z[:, 1, 1] = cz
+        rotation_z[:, 2, 2] = 1
+
+        rotation = rotation_z @ rotation_y @ rotation_x
+
+        # Convert a rotation in physical millimetres to normalized grid
+        # coordinates. grid coordinates are (W,H,D), while metadata is (H,W,D).
+        spacing_grid = spacing_hwd[:, (1, 0, 2)].to(device=device, dtype=work_dtype)
+        size_grid = torch.tensor(
+            (x_hwd.shape[3], x_hwd.shape[2], x_hwd.shape[4]),
+            device=device,
+            dtype=work_dtype,
+        )
+        half_extent_mm = (spacing_grid * size_grid[None]).clamp_min(1e-6)
+        physical_to_normalized = torch.diag_embed(half_extent_mm.reciprocal())
+        normalized_to_physical = torch.diag_embed(half_extent_mm)
+        linear = (
+            physical_to_normalized
+            @ rotation
+            @ normalized_to_physical
+        ) * scales[:, None, None]
+
+        theta = torch.zeros(
+            (batch_size, 3, 4), device=device, dtype=work_dtype
+        )
+        theta[:, :, :3] = linear
+        theta[:, :, 3] = translations
+
+        identity = torch.eye(
+            3, 4, device=device, dtype=work_dtype
+        ).unsqueeze(0)
+        theta = torch.where(apply[:, None, None], theta, identity)
+
+        input_dtype = x_hwd.dtype
+        x_float = x_hwd.permute(0, 1, 4, 2, 3).to(dtype=work_dtype)
+        grid = F.affine_grid(
+            theta,
+            size=x_float.shape,
+            align_corners=False,
+        )
+        transformed = F.grid_sample(
+            x_float,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        return transformed.to(dtype=input_dtype).permute(0, 1, 3, 4, 2).contiguous()
 
     @staticmethod
     def _make_3d_block_mask(
@@ -388,13 +554,13 @@ class BrainDinoViewTransform:
                 torch.randint(1, min(width, remaining_area) + 1, (1,), generator=generator, device=device).item()
             )
 
-            block_depth = min(depth, max(1, math.ceil(target_volume / (block_width * block_height))))
+            block_depth = min(depth, max(1, math.ceil(target_volume / (block_height * block_width))))
 
             start_height = int(
-                torch.randint(0, height - block_height + 1, (1,), generator=generator, device=device, ).item()
+                torch.randint(0, height - block_height + 1, (1,), generator=generator, device=device).item()
             )
             start_width = int(
-                torch.randint(0, width - block_width + 1, (1,), generator=generator, device=device, ).item()
+                torch.randint(0, width - block_width + 1, (1,), generator=generator, device=device).item()
             )
             start_depth = int(
                 torch.randint(0, depth - block_depth + 1, (1,), generator=generator, device=device).item()
@@ -586,13 +752,25 @@ class BrainDinoViewTransform:
         if image.ndim != 5:
             raise ValueError(
                 "BrainDinoViewTransform must run after collation and expects "
-                "batch['image'] with shape [B, C, D, H, W]."
+                "batch['image'] with shape [B, C, H, W, D]."
             )
 
         info = batch.get("info", {})
 
         if "spacing" not in info:
             raise KeyError("batch['info']['spacing'] is required.")
+        spacing_hwd = torch.as_tensor(
+            info["spacing"],
+            device=image.device,
+            dtype=torch.float32,
+        )
+        if spacing_hwd.shape != (image.shape[0], 3):
+            raise ValueError(
+                "info['spacing'] must have shape [B, 3] in (H, W, D) order, "
+                f"got {tuple(spacing_hwd.shape)}."
+            )
+        if not torch.isfinite(spacing_hwd).all() or (spacing_hwd <= 0).any():
+            raise ValueError("info['spacing'] must contain finite positive values.")
 
         channel_mask = info.get("channel_mask")
 
@@ -637,13 +815,14 @@ class BrainDinoViewTransform:
 
         # Work with normalized tensor metadata from this point forward.
         info = _clone_metadata(info)
+        info["spacing"] = spacing_hwd
         info["modality"] = modality
         info["channel_mask"] = channel_mask
 
         # Spatial/intensity augmentation is sampled once for each global crop.
         # The resulting crop is shared by its teacher and student pair.
         base_global_crops = [
-            self._augment_view(image, self.global_crop_size, channel_mask)
+            self._augment_view(image, self.global_crop_size, channel_mask, spacing_hwd)
             for _ in range(self.n_global_crops)
         ]
 
@@ -671,7 +850,7 @@ class BrainDinoViewTransform:
 
         # Local crops are student-only.
         base_local_crops = [
-            self._augment_view(image, self.local_crop_size, channel_mask)
+            self._augment_view(image, self.local_crop_size, channel_mask, spacing_hwd)
             for _ in range(self.n_local_crops)
         ]
 
@@ -724,6 +903,12 @@ def braindino_GPU_train_transforms(
     one_unknown_probability: float = 0.25,
     all_unknown_probability: float = 0.10,
     unknown_modality_id: int = 0,
+    flip_probability: float = 0.0,
+    flip_axes_hwd: Sequence[int] = (0, 1, 2),
+    affine_probability: float = 0.4,
+    rotation_degrees: float = 10.0,
+    scale_range: Tuple[float, float] = (0.9, 1.1),
+    translation_fraction: float = 0.05,
 ) -> BrainDinoViewTransform:
     return BrainDinoViewTransform(
         global_crop_size=global_crop_size,
@@ -736,6 +921,12 @@ def braindino_GPU_train_transforms(
         one_unknown_probability=one_unknown_probability,
         all_unknown_probability=all_unknown_probability,
         unknown_modality_id=unknown_modality_id,
+        flip_probability=flip_probability,
+        flip_axes_hwd=flip_axes_hwd,
+        affine_probability=affine_probability,
+        rotation_degrees=rotation_degrees,
+        scale_range=scale_range,
+        translation_fraction=translation_fraction,
         training=True,
     )
 
@@ -756,6 +947,7 @@ def braindino_GPU_val_transforms(
         n_local_crops=n_local_crops,
         mask_ratio=mask_ratio,
         flip_probability=0.0,
+        affine_probability=0.0,
         channel_drop_probability=0.0,
         one_unknown_probability=0.0,
         all_unknown_probability=0.0,
