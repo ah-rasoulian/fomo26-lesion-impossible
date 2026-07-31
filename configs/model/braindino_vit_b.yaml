@@ -5,9 +5,9 @@ dimensions: 3D
 
 pretrain_net: pretrain_braindino_vit_b
 
-patch_kernel_size: 8
+patch_kernel_size: 9
 patch_stride: 8
-patch_padding: 0
+patch_padding: 4
 
 init_sigma_mm: 4.0
 learn_sigma: true

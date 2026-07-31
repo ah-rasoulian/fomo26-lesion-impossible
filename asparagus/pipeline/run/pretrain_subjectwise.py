@@ -81,7 +81,7 @@ def main(cfg: DictConfig) -> None:
         # Best checkpoint according to validation loss.
         ModelCheckpoint(
             dirpath=path_store.ckpt_save_dir,
-            filename="best-step-{step}-val_loss-{val_loss:.4f}",
+            filename="best-step-{step}-val_loss-{val/loss/total:.4f}",
             monitor="val/loss/total",
             mode="min",
             save_top_k=1,
