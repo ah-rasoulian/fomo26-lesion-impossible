@@ -4,7 +4,6 @@ import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import wandb
-from lightning.pytorch.loggers import WandbLogger
 from torchvision.utils import make_grid
 
 import torch
@@ -117,7 +116,7 @@ class BrainDinoModule(BaseModule):
             region_max_masked_fraction: float = 0.5,
             koleo_eps: float = 1e-8,
 
-            visual_log_every_n_steps: int = 10,
+            visual_log_every_n_steps: int = 1000,
             visual_log_max_channels: int = 3,
             visual_log_sample_index: int = 0,
     ) -> None:

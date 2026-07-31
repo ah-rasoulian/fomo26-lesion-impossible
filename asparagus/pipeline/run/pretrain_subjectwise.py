@@ -20,6 +20,10 @@ load_dotenv()
 OmegaConf.register_new_resolver("random", lambda min, max: random.randint(min, max))
 OmegaConf.register_new_resolver("version", lambda: generate_unused_run_id(), use_cache=True)
 OmegaConf.register_new_resolver("eval", eval)
+OmegaConf.register_new_resolver("ceil_div",
+    lambda numerator, denominator: (int(numerator) + int(denominator) - 1)
+    // int(denominator),
+)
 Plugins.instance().register(PretrainSearchpathPlugin)
 
 
@@ -29,7 +33,10 @@ Plugins.instance().register(PretrainSearchpathPlugin)
     version_base="1.2",
 )
 def main(cfg: DictConfig) -> None:
-    print(f"{OmegaConf.to_yaml(cfg)}\n Version: {cfg.run_id}\n Run dir: {HydraConfig.get().run.dir}\n")
+    if HydraConfig.get().runtime.output_dir:
+        print(f"Version: {cfg.run_id}")
+        print(f"Run dir: {HydraConfig.get().run.dir}")
+
     logging_safe_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     file_store, path_store, version_store = prepare_subjectwise_experiment(cfg)
     pl.seed_everything(seed=cfg.training.seed, workers=True)
@@ -67,7 +74,6 @@ def main(cfg: DictConfig) -> None:
             ),
             save_top_k=1,
             save_last=True,
-            save_on_exception=True,
             save_weights_only=False,
             enable_version_counter=False,
         ),
@@ -191,6 +197,7 @@ def main(cfg: DictConfig) -> None:
         limit_val_batches=cfg.training.val_steps_per_epoch,
         use_distributed_sampler=False,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
+        num_sanity_val_steps=2,
     )
 
     if trainer.is_global_zero:

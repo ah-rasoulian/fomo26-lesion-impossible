@@ -239,8 +239,8 @@ class BrainDinoViewTransform:
         training: bool = True,
         flip_probability: float = 0.5,
         intensity_augmentation: Optional[BrainDinoIntensityAugmentation] = None,
-        channel_drop_probability: float = 0.35,
-        one_unknown_probability: float = 0.25,
+        channel_drop_probability: float = 0.25,
+        one_unknown_probability: float = 0.20,
         all_unknown_probability: float = 0.10,
         unknown_modality_id: int = 0,
     ) -> None:
@@ -643,7 +643,7 @@ class BrainDinoViewTransform:
         # Spatial/intensity augmentation is sampled once for each global crop.
         # The resulting crop is shared by its teacher and student pair.
         base_global_crops = [
-            self._augment_view(image,self.global_crop_size,channel_mask,)
+            self._augment_view(image, self.global_crop_size, channel_mask)
             for _ in range(self.n_global_crops)
         ]
 
@@ -659,19 +659,19 @@ class BrainDinoViewTransform:
 
         # Teacher retains all original channels.
         teacher_global_crops = [
-            self._apply_channel_mask(crop,crop_info["channel_mask"],)
-            for crop, crop_info in zip(base_global_crops,teacher_global_info)
+            self._apply_channel_mask(crop, crop_info["channel_mask"])
+            for crop, crop_info in zip(base_global_crops, teacher_global_info)
         ]
 
         # Each student global view gets an independent modality subset.
         global_crops = [
             self._apply_channel_mask(crop,crop_info["channel_mask"])
-            for crop, crop_info in zip(base_global_crops,student_global_info)
+            for crop, crop_info in zip(base_global_crops, student_global_info)
         ]
 
         # Local crops are student-only.
         base_local_crops = [
-            self._augment_view(image,self.local_crop_size,channel_mask,)
+            self._augment_view(image, self.local_crop_size, channel_mask)
             for _ in range(self.n_local_crops)
         ]
 
@@ -682,7 +682,7 @@ class BrainDinoViewTransform:
 
         local_crops = [
             self._apply_channel_mask(crop,crop_info["channel_mask"])
-            for crop, crop_info in zip(base_local_crops,student_local_info)
+            for crop, crop_info in zip(base_local_crops, student_local_info)
         ]
 
         global_masks = [
