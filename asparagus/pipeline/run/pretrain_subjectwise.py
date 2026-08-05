@@ -68,10 +68,7 @@ def main(cfg: DictConfig) -> None:
         ModelCheckpoint(
             dirpath=path_store.ckpt_save_dir,
             filename="recovery-step-{step}",
-            every_n_train_steps=(
-                    cfg.model.recovery_ckpt_every_n_optimizer_steps
-                    * cfg.training.accumulate_grad_batches
-            ),
+            every_n_train_steps=cfg.model.recovery_ckpt_every_n_optimizer_steps,
             save_top_k=1,
             save_last=True,
             save_weights_only=False,
@@ -96,10 +93,7 @@ def main(cfg: DictConfig) -> None:
         ModelCheckpoint(
             dirpath=path_store.ckpt_save_dir,
             filename="snapshot-step-{step}",
-            every_n_train_steps=(
-                    cfg.model.snapshot_ckpt_every_n_optimizer_steps
-                    * cfg.training.accumulate_grad_batches
-            ),
+            every_n_train_steps=cfg.model.snapshot_ckpt_every_n_optimizer_steps,
             save_top_k=-1,
             save_last=False,
             save_weights_only=False,
@@ -221,10 +215,13 @@ def main(cfg: DictConfig) -> None:
         print(f"  - Expected pseudo-epochs: {pseudo_epochs:.1f}")
         print(f"  - Warmup: {warmup_steps:,} optimizer steps ({cfg.model.warmup_ratio:.1%})")
 
+    resume_ckpt = cfg.training.get("resume_ckpt")
+    if resume_ckpt:
+        print("Resuming from checkpoint:", resume_ckpt)
     trainer.fit(
         model=model_module,
         datamodule=data_module,
-        ckpt_path="last",
+        ckpt_path=resume_ckpt,
     )
 
 

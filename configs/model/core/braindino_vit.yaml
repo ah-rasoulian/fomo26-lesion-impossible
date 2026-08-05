@@ -27,9 +27,9 @@ snapshot_ckpt_every_n_optimizer_steps: 10000
 
 pretrain_optim: AdamW
 pretrain_lr: 1.0e-4
-weight_decay: 0.04
+weight_decay: 0.01
 
-warmup_ratio: 0.10
+warmup_ratio: 0.05
 cosine_period_ratio: 1.0
 minimum_lr: 1.0e-6
 

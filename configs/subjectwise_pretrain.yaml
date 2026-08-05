@@ -20,26 +20,27 @@ data:
   fold: 0
 
 training:
+  resume_ckpt:
   source_patch_size: [ 160, 160, 160 ]
   global_crop_size: [ 128, 128, 128 ]
   local_crop_size: [ 64, 64, 64 ]
 
   mask_ratio: 0.4
   n_global_crops: 2
-  n_local_crops: 4
+  n_local_crops: 2
 
   seed: ${random:0,1000000}
 
-  batch_size: 8
-  accumulate_grad_batches: 4
+  batch_size: 4
+  accumulate_grad_batches: 8
 
-  samples_per_epoch: 120_000
+  samples_per_epoch: 20_000
   physical_global_batch_size: ${eval:"${training.batch_size} * ${hardware.num_devices} * ${hardware.num_nodes}"}
   effective_global_batch_size: ${eval:"${training.physical_global_batch_size} * ${training.accumulate_grad_batches}"}
 
   steps_per_epoch: ${ceil_div:${training.samples_per_epoch},${training.physical_global_batch_size}}
 
-  max_samples: 16_000_000
+  max_samples: 8_000_000
   steps: ${eval:"${training.max_samples} // ${training.effective_global_batch_size}"}
 
   val_steps_per_epoch: 1.0
