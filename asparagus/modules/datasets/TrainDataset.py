@@ -1,31 +1,147 @@
+from pathlib import Path
+from typing import Any, Optional
+
 import nibabel as nib
 import numpy as np
 import torch
 import torchvision
-from asparagus.paths import get_data_path, get_source_labels_path
-from gardening_tools.functional.nibabel_utils import reorient_nib_image
-from gardening_tools.functional.paths.read import load_pickle, read_file_to_nifti_or_np
-from gardening_tools.functional.type_conversions import nifti_or_np_to_np
-from asparagus.functional.loading import get_modality_id
-from asparagus.functional.loading import MODALITY_TO_ID
 from nibabel.orientations import aff2axcodes
 from torch.utils.data import Dataset
-from typing import Optional
+
+from asparagus.functional.loading import MODALITY_TO_ID, get_modality_id
+from asparagus.paths import get_data_path, get_source_labels_path
+from gardening_tools.functional.nibabel_utils import reorient_nib_image
+from gardening_tools.functional.paths.read import (
+    load_pickle,
+    read_file_to_nifti_or_np,
+)
+from gardening_tools.functional.type_conversions import nifti_or_np_to_np
 
 
 def get_processed_data_info(file: str) -> dict:
-    if file.endswith(".pt"):
-        file = file.replace(".pt", ".pkl")
-    info = load_pickle(file)
+    properties_file = file.replace(".pt", ".pkl")
+    properties = load_pickle(properties_file)
+
+    modality_ids = torch.tensor(
+        [MODALITY_TO_ID[modality] for modality in properties["modalities"]],dtype=torch.long,
+    )
+
     return {
-        "affine": torch.as_tensor(info["nifti_metadata"]["affine"], dtype=torch.float32),
-        "spacing": torch.as_tensor(info["new_spacing"], dtype=torch.float32),
-        "direction": info["new_direction"],
-        "modality": torch.tensor([MODALITY_TO_ID[m] for m in info["modalities"]], dtype=torch.long),
+        "affine": torch.as_tensor(properties["nifti_metadata"]["affine"], dtype=torch.float32),
+        "spacing": torch.as_tensor(properties["new_spacing"], dtype=torch.float32),
+        "direction": properties["new_direction"],
+        "modality": modality_ids,
     }
 
 
-class SegDataset(Dataset):
+def _ensure_image_shape(
+    image: torch.Tensor,
+    file: str,
+) -> torch.Tensor:
+    """
+    Ensure that an image follows the [C, D, H, W] convention.
+    """
+    image = torch.as_tensor(image).float()
+
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+
+    if image.ndim != 4:
+        raise RuntimeError(
+            f"Expected image with shape [C, D, H, W], but {file} "
+            f"produced shape {tuple(image.shape)}."
+        )
+
+    return image
+
+
+def _ensure_label_shape(
+    label: torch.Tensor,
+    file: str,
+) -> torch.Tensor:
+    """
+    Ensure that a segmentation label follows [C, D, H, W].
+    """
+    label = torch.as_tensor(label).float()
+
+    if label.ndim == 3:
+        label = label.unsqueeze(0)
+
+    if label.ndim != 4:
+        raise RuntimeError(
+            f"Expected segmentation label with shape [C, D, H, W], "
+            f"but {file} produced shape {tuple(label.shape)}."
+        )
+
+    return label
+
+
+def _validate_modality_count(
+    data_dict: dict,
+    file: str,
+) -> None:
+    """
+    Verify that one modality ID is provided for each image channel.
+    """
+    image = data_dict.get("image")
+    info = data_dict.get("info", {})
+    modality = info.get("modality")
+
+    if image is None or modality is None:
+        return
+
+    modality = torch.as_tensor(modality,dtype=torch.long).reshape(-1)
+
+    info["modality"] = modality
+
+    if modality.numel() != image.shape[0]:
+        raise RuntimeError(
+            f"Image/modality mismatch for {file}: image has "
+            f"{image.shape[0]} channels, but info['modality'] has "
+            f"{modality.numel()} entries."
+        )
+
+
+def _sanitize_tensor(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if not torch.is_floating_point(tensor):
+        return tensor
+
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        tensor = torch.nan_to_num(
+            tensor,
+            nan=0.0,
+            posinf=4.0,
+            neginf=-1.0,
+        )
+
+    return tensor
+
+
+def _sanitize_data_dict(
+    data_dict: dict,
+) -> dict:
+    """
+    Sanitize image and task labels after all transforms have been applied.
+    """
+    tensor_keys = (
+        "image",
+        "label",
+        "CLSREG_label",
+        "src_label",
+    )
+
+    for key in tensor_keys:
+        value = data_dict.get(key)
+
+        if isinstance(value, torch.Tensor):
+            data_dict[key] = _sanitize_tensor(value)
+
+    return data_dict
+
+
+class BaseTaskDataset(Dataset):
     def __init__(
         self,
         files: list,
@@ -36,200 +152,441 @@ class SegDataset(Dataset):
         self.files = files
         self.transforms = transforms
 
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        file = self.files[idx]
-        data = torch.load(file)
-        foreground_locations = load_pickle(file.replace(".pt", ".pkl"))["foreground_locations"]
-        data_dict = {
-            "file_path": file,
-            "image": data[:-1],
-            "label": data[-1:],
-            "foreground_locations": foreground_locations,
-            "info": get_processed_data_info(file),
-            "transforms_applied": {},
-        }
-
-        return self._transform(data_dict)
-
-    def _transform(self, data_dict):
-        if self.transforms is not None:
-            data_dict = self.transforms(data_dict)
-        data_dict.pop("foreground_locations")
-        return data_dict
-
-
-class ClsRegDataset(Dataset):
-    def __init__(
-        self,
-        files: list,
-        transforms: Optional[torchvision.transforms.Compose] = None,
-    ):
-        super().__init__()
-
-        self.files = files
+        # Retained for compatibility with code that accesses this name.
         self.composed_transforms = transforms
-        self.transforms = transforms
 
     def __len__(self):
         return len(self.files)
 
+    def _transform(
+        self,
+        data_dict: dict,
+    ) -> dict:
+        if self.transforms is not None:
+            data_dict = self.transforms(data_dict)
+
+        return _sanitize_data_dict(data_dict)
+
+
+class SegDataset(BaseTaskDataset):
     def __getitem__(self, idx):
         file = self.files[idx]
-        data = torch.load(file)
+
+        data = torch.load(file, map_location="cpu", weights_only=False)
+
+        if not isinstance(data, torch.Tensor):
+            raise RuntimeError(
+                f"Expected {file} to contain a tensor, but found "
+                f"{type(data).__name__}."
+            )
+
+        if data.ndim != 4:
+            raise RuntimeError(
+                f"Expected packed segmentation data with shape "
+                f"[C + 1, D, H, W], but {file} produced "
+                f"{tuple(data.shape)}."
+            )
+
+        if data.shape[0] < 2:
+            raise RuntimeError(
+                f"Expected at least one image channel and one label "
+                f"channel in {file}, but found {data.shape[0]} channels."
+            )
+
+        image = _ensure_image_shape(data[:-1], file)
+        label = _ensure_label_shape(data[-1:], file)
+
+        if image.shape[1:] != label.shape[1:]:
+            raise RuntimeError(
+                f"Image and label spatial shapes do not match for "
+                f"{file}: image={tuple(image.shape)}, "
+                f"label={tuple(label.shape)}."
+            )
+
+        properties = load_pickle(
+            file.replace(".pt", ".pkl")
+        )
+
         data_dict = {
             "file_path": file,
-            "image": data[0],
-            "CLSREG_label": data[1],
+            "image": image,
+            "label": label,
+            "foreground_locations": properties["foreground_locations"],
             "info": get_processed_data_info(file),
             "transforms_applied": {},
         }
 
-        return self._transform(data_dict)
+        _validate_modality_count(data_dict, file)
 
-    def _transform(self, data_dict):
-        if self.transforms is not None:
-            data_dict = self.transforms(data_dict)
+        data_dict = self._transform(data_dict)
+
+        # foreground_locations is only required by transforms such as
+        # foreground-aware cropping.
+        data_dict.pop("foreground_locations", None)
+
         return data_dict
 
 
-class SegTestDataset(Dataset):
-    def __init__(
-        self,
-        files: list,
-        transforms: Optional[torchvision.transforms.Compose] = None,
-    ):
-        super().__init__()
-
-        self.files = files
-        self.transforms = transforms
-
-    def __len__(self):
-        return len(self.files)
-
+class ClsRegDataset(BaseTaskDataset):
     def __getitem__(self, idx):
         file = self.files[idx]
-        data = torch.load(file)
+
+        data = torch.load(file, map_location="cpu", weights_only=False)
+
+        if not isinstance(data, (tuple, list)):
+            raise RuntimeError(
+                f"Expected {file} to contain (image, label), but found "
+                f"{type(data).__name__}."
+            )
+
+        if len(data) < 2:
+            raise RuntimeError(
+                f"Expected (image, label) in {file}, but found "
+                f"{len(data)} elements."
+            )
+
+        image = _ensure_image_shape(data[0], file)
+        label = torch.as_tensor(data[1])
+
+        data_dict = {
+            "file_path": file,
+            "image": image,
+            "CLSREG_label": label,
+            "info": get_processed_data_info(file),
+            "transforms_applied": {},
+        }
+
+        _validate_modality_count(data_dict, file)
+
+        return self._transform(data_dict)
+
+
+class SegTestDataset(BaseTaskDataset):
+    def __getitem__(self, idx):
+        file = self.files[idx]
+
+        data = torch.load(file, map_location="cpu", weights_only=False)
+
+        if not isinstance(data, torch.Tensor):
+            raise RuntimeError(
+                f"Expected {file} to contain a tensor, but found "
+                f"{type(data).__name__}."
+            )
+
+        if data.ndim != 4 or data.shape[0] < 2:
+            raise RuntimeError(
+                f"Expected packed segmentation data with shape "
+                f"[C + 1, D, H, W], but {file} produced "
+                f"{tuple(data.shape)}."
+            )
+
+        image = _ensure_image_shape(data[:-1], file)
+        label = _ensure_label_shape(data[-1:], file)
+
+        if image.shape[1:] != label.shape[1:]:
+            raise RuntimeError(
+                f"Image and label spatial shapes do not match for "
+                f"{file}: image={tuple(image.shape)}, "
+                f"label={tuple(label.shape)}."
+            )
+
         properties = load_pickle(file.replace(".pt", ".pkl"))
+
         src_label = self._get_src_label(file, properties)
 
-        id = "_".join(file.split("/")[-3:]).replace(".pt", "")
+        sample_id = "_".join(Path(file).parts[-3:]).replace(".pt", "")
+
         data_dict = {
             "file_path": file,
-            "image": data[:-1],
-            "label": data[-1:],
+            "image": image,
+            "label": label,
             "src_label": src_label,
             "properties": properties,
-            "id": id,
+            "id": sample_id,
             "info": get_processed_data_info(file),
+            "transforms_applied": {},
         }
+
+        _validate_modality_count(data_dict, file)
 
         return self._transform(data_dict)
 
-    def _transform(self, data_dict):
-        if self.transforms is not None:
-            data_dict = self.transforms(data_dict)
-        return data_dict
+    def _get_src_label(
+        self,
+        file: str,
+        properties: dict,
+    ) -> torch.Tensor:
+        # Original, unprocessed label used for restoring and evaluating
+        # predictions in the source-image space.
+        src_label_path = (
+            file.replace(get_data_path(), get_source_labels_path(),).replace(".pt","_label.nii.gz")
+        )
 
-    def _get_src_label(self, file, properties):
-        # source label is the label from the original dataset without any preprocessing
-        src_label_path = file.replace(get_data_path(), get_source_labels_path()).replace(".pt", "_label.nii.gz")
         src_label_nii = read_file_to_nifti_or_np(src_label_path)
+
         src_label_nii = reorient_nib_image(
             src_label_nii,
-            original_orientation=properties["original_orientation"],
+            original_orientation=properties[
+                "original_orientation"
+            ],
             target_orientation=properties["new_direction"],
         )
+
         src_label_npy = nifti_or_np_to_np(src_label_nii)
+
+        # Preserve the existing [1, 1, D, H, W] convention used by
+        # downstream test-time restoration/evaluation.
         return torch.from_numpy(src_label_npy).float().unsqueeze(0).unsqueeze(0)
 
 
-class ClsRegTestDataset(Dataset):
-    def __init__(
-        self,
-        files: list,
-        transforms: Optional[torchvision.transforms.Compose] = None,
-    ):
-        super().__init__()
-
-        self.files = files
-        self.transforms = transforms
-
-    def __len__(self):
-        return len(self.files)
-
+class ClsRegTestDataset(BaseTaskDataset):
     def __getitem__(self, idx):
         file = self.files[idx]
-        data = torch.load(file)
+
+        data = torch.load(file, map_location="cpu", weights_only=False)
+
+        if not isinstance(data, (tuple, list)):
+            raise RuntimeError(
+                f"Expected {file} to contain (image, label), but found "
+                f"{type(data).__name__}."
+            )
+
+        if len(data) < 2:
+            raise RuntimeError(
+                f"Expected (image, label) in {file}, but found "
+                f"{len(data)} elements."
+            )
+
+        image = _ensure_image_shape(data[0], file)
+        label = torch.as_tensor(data[1])
+
         data_dict = {
             "file_path": file,
-            "image": data[0],
-            "CLSREG_label": data[1],
+            "image": image,
+            "CLSREG_label": label,
             "info": get_processed_data_info(file),
+            "transforms_applied": {},
         }
+
+        _validate_modality_count(data_dict, file)
 
         return self._transform(data_dict)
 
-    def _transform(self, data_dict):
-        if self.transforms is not None:
-            data_dict = self.transforms(data_dict)
-        return data_dict
 
-
-class SingleSubjectPredictDataset(Dataset):
-    def __init__(
-        self,
-        files: list,
-        transforms: Optional[torchvision.transforms.Compose] = None,
-    ):
-        super().__init__()
-
-        self.files = files
-        self.transforms = transforms
-
+class SingleSubjectPredictDataset(BaseTaskDataset):
     def __len__(self):
         return 1
 
     def __getitem__(self, idx):
-        properties = {}
-        all_channels = []
-        for file in self.files:
-            if file.endswith(".pt"):
-                data = torch.load(file)
-            elif file.endswith(".npy"):
-                data = torch.from_numpy(np.load(file))
-            elif file.endswith(".nii") or file.endswith(".nii.gz"):
-                data = nib.load(file)
-                properties["nifti_metadata"] = {
-                    "affine": data.affine,
-                    "header": data.header,
-                    "reoriented": False,
-                }
-                data = torch.from_numpy(data.get_fdata()[np.newaxis])
-            else:
-                raise ValueError(f"Unsupported file type: {file}")
-            data = data.float()
-            all_channels.append(data)
+        if idx != 0:
+            raise IndexError(
+                f"SingleSubjectPredictDataset only contains index 0, "
+                f"but received index {idx}."
+            )
 
-        data = torch.vstack(all_channels)
-        properties["original_size"] = data.shape[1:]  # Exclude channel dimension
+        if not self.files:
+            raise RuntimeError(
+                "SingleSubjectPredictDataset received no files."
+            )
+
+        properties: dict[str, Any] = {}
+        images = []
+        spatial_shapes = set()
+
+        reference_affine = None
+        reference_spacing = None
+        reference_direction = None
+
+        for file in self.files:
+            image, file_info = self._load_image(file)
+
+            if image.shape[0] != 1:
+                raise RuntimeError(
+                    f"Expected one channel per input file, but {file} "
+                    f"produced {image.shape[0]} channels."
+                )
+
+            spatial_shapes.add(tuple(image.shape[1:]))
+            images.append(image)
+
+            if file_info is not None:
+                if reference_affine is None:
+                    reference_affine = file_info["affine"]
+                    reference_spacing = file_info["spacing"]
+                    reference_direction = file_info["direction"]
+                    properties.update(
+                        file_info.get("properties", {})
+                    )
+                else:
+                    self._validate_same_grid(
+                        file=file,
+                        file_info=file_info,
+                        reference_affine=reference_affine,
+                        reference_spacing=reference_spacing,
+                        reference_direction=reference_direction,
+                    )
+
+        if len(spatial_shapes) != 1:
+            raise RuntimeError(
+                "Selected images do not have matching spatial shapes: "
+                f"{self.files}"
+            )
+
+        image = torch.cat(images, dim=0)
+        properties["original_size"] = tuple(image.shape[1:])
+
+        if reference_affine is None:
+            raise RuntimeError(
+                "Could not determine affine, spacing, and direction. "
+                "For .pt and .npy inputs, a matching .pkl metadata "
+                "file is required."
+            )
+
+        modality_ids = torch.as_tensor(get_modality_id(self.files), dtype=torch.long).reshape(-1)
+
         data_dict = {
-            "file_path": file,
-            "image": data,
+            "file_path": list(self.files),
+            "image": image,
             "properties": properties,
             "info": {
-                "affine": torch.as_tensor(properties["nifti_metadata"]["affine"], dtype=torch.float32),
-                "spacing": torch.as_tensor(properties["nifti_metadata"]["header"].get_zooms()[:3], dtype=torch.float32),
-                "direction": "".join(aff2axcodes(properties["nifti_metadata"]["affine"])),
-                "modality": get_modality_id(self.files),
-            }
+                "affine": reference_affine,
+                "spacing": reference_spacing,
+                "direction": reference_direction,
+                "modality": modality_ids,
+            },
+            "transforms_applied": {},
         }
+
+        _validate_modality_count(
+            data_dict,
+            str(self.files),
+        )
 
         return self._transform(data_dict)
 
-    def _transform(self, data_dict):
-        if self.transforms is not None:
-            data_dict = self.transforms(data_dict)
-        return data_dict
+    def _load_image(
+        self,
+        file: str,
+    ) -> tuple[torch.Tensor, Optional[dict]]:
+        if file.endswith(".pt"):
+            loaded = torch.load(file, map_location="cpu", weights_only=False)
+
+            image = _ensure_image_shape(loaded, file)
+
+            info = self._load_sidecar_info(file)
+            return image, info
+
+        if file.endswith(".npy"):
+            image = torch.from_numpy(np.load(file))
+
+            image = _ensure_image_shape(image, file)
+
+            info = self._load_sidecar_info(file)
+            return image, info
+
+        if file.endswith((".nii", ".nii.gz")):
+            nifti = nib.load(file)
+
+            # nibabel returns [D, H, W] according to the current
+            # project convention.
+            image = torch.from_numpy(
+                np.asarray(nifti.dataobj, dtype=np.float32)
+            ).unsqueeze(0)
+
+            image = _ensure_image_shape(image, file)
+
+            affine = torch.as_tensor(nifti.affine, dtype=torch.float32)
+
+            info = {
+                "affine": affine,
+                "spacing": torch.as_tensor(nifti.header.get_zooms()[:3], dtype=torch.float32),
+                "direction": "".join(aff2axcodes(nifti.affine)),
+                "properties": {
+                    "nifti_metadata": {
+                        "affine": nifti.affine,
+                        "header": nifti.header,
+                        "reoriented": False,
+                    },
+                },
+            }
+
+            return image, info
+
+        raise ValueError(
+            f"Unsupported file type: {file}"
+        )
+
+    @staticmethod
+    def _load_sidecar_info(
+        file: str,
+    ) -> Optional[dict]:
+        if file.endswith(".pt"):
+            sidecar = file.replace(".pt", ".pkl")
+        elif file.endswith(".npy"):
+            sidecar = file.replace(".npy", ".pkl")
+        else:
+            return None
+
+        if not Path(sidecar).is_file():
+            return None
+
+        properties = load_pickle(sidecar)
+
+        nifti_metadata = properties.get("nifti_metadata", {})
+
+        affine = nifti_metadata.get("affine")
+        spacing = properties.get("new_spacing")
+        direction = properties.get("new_direction")
+
+        if (
+            affine is None
+            or spacing is None
+            or direction is None
+        ):
+            raise RuntimeError(
+                f"Metadata file {sidecar} does not contain affine, "
+                "new_spacing, and new_direction."
+            )
+
+        return {
+            "affine": torch.as_tensor(affine, dtype=torch.float32),
+            "spacing": torch.as_tensor(spacing, dtype=torch.float32),
+            "direction": direction,
+            "properties": properties,
+        }
+
+    @staticmethod
+    def _validate_same_grid(
+        file: str,
+        file_info: dict,
+        reference_affine: torch.Tensor,
+        reference_spacing: torch.Tensor,
+        reference_direction: str,
+    ) -> None:
+        if file_info["direction"] != reference_direction:
+            raise RuntimeError(
+                f"Direction mismatch for {file}: "
+                f"{file_info['direction']} != {reference_direction}."
+            )
+
+        if not torch.allclose(
+            file_info["spacing"],
+            reference_spacing,
+            atol=1e-5,
+            rtol=1e-5,
+        ):
+            raise RuntimeError(
+                f"Spacing mismatch for {file}: "
+                f"{file_info['spacing'].tolist()} != "
+                f"{reference_spacing.tolist()}."
+            )
+
+        if not torch.allclose(
+            file_info["affine"],
+            reference_affine,
+            atol=1e-4,
+            rtol=1e-4,
+        ):
+            raise RuntimeError(
+                f"Affine mismatch for {file}."
+            )

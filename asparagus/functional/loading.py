@@ -36,6 +36,7 @@ MODALITY_TO_ID: Dict[str, int] = {
     # Keep separate from ADC because Task 1 uses both DWI and ADC.
     # -------------------------------------------------------------------------
     "dwi": 2,          # Diffusion-weighted image, usually b1000 in this challenge.
+    "dwi_b1000": 2,  # Explicit b1000 DWI filename token.
 
     # -------------------------------------------------------------------------
     # ADC

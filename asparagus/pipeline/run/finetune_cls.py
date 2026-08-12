@@ -4,7 +4,7 @@ import os
 import random
 from asparagus.functional.versioning import generate_unused_run_id
 from asparagus.modules.hydra.plugins.searchpath_plugins import FinetuneSearchpathPlugin
-from asparagus.modules.transforms.presets import CPU_clsreg_val_test_transforms_crop
+from asparagus.modules.transforms.presets import CPU_vit_val_test_transforms
 from asparagus.paths import get_config_path
 from asparagus.pipeline.auto_configuration.checkpoint import resolve_checkpoint
 from asparagus.pipeline.auto_configuration.experiment_setup import (
@@ -28,6 +28,10 @@ load_dotenv()
 OmegaConf.register_new_resolver("random", lambda min, max: random.randint(min, max))
 OmegaConf.register_new_resolver("version", lambda: generate_unused_run_id(), use_cache=True)
 OmegaConf.register_new_resolver("eval", eval)
+OmegaConf.register_new_resolver("ceil_div",
+    lambda numerator, denominator: (int(numerator) + int(denominator) - 1)
+    // int(denominator),
+)
 Plugins.instance().register(FinetuneSearchpathPlugin)
 
 
@@ -37,25 +41,28 @@ Plugins.instance().register(FinetuneSearchpathPlugin)
     version_base="1.2",
 )
 def main(cfg: DictConfig) -> None:
-    print(f"{OmegaConf.to_yaml(cfg)}\n Version: {cfg.run_id}\n Run dir: {HydraConfig.get().run.dir}\n")
+    if HydraConfig.get().runtime.output_dir:
+        print(f"Version: {cfg.run_id}")
+        print(f"Run dir: {HydraConfig.get().run.dir}")
+
     logging_safe_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     file_store, path_store, version_store = prepare_standard_experiment(cfg)
     weights = resolve_checkpoint(cfg)
     pl.seed_everything(seed=cfg.training.seed, workers=True)
 
-    loggers = logging(
-        ckpt_wandb_id=version_store.wandb_id,
-        ckpt_mlflow_id=version_store.mlflow_id,
-        log_file_name=HydraConfig.get().job.name,
-        run_dir=path_store.run_dir,
-        version=version_store.version,
-        wandb_config=logging_safe_cfg,
-        wandb_experiment=HydraConfig.get().job.config_name,
-        wandb_project=cfg.logger.wandb_project,
-        wandb_logging=cfg.logger.wandb_logging,
-        mlflow_logging=cfg.logger.mlflow_logging,
-        log_to_stdout=cfg.logger.log_to_stdout,
-    )
+    # loggers = logging(
+    #     ckpt_wandb_id=version_store.wandb_id,
+    #     ckpt_mlflow_id=version_store.mlflow_id,
+    #     log_file_name=HydraConfig.get().job.name,
+    #     run_dir=path_store.run_dir,
+    #     version=version_store.version,
+    #     wandb_config=logging_safe_cfg,
+    #     wandb_experiment=HydraConfig.get().job.config_name,
+    #     wandb_project=cfg.logger.wandb_project,
+    #     wandb_logging=cfg.logger.wandb_logging,
+    #     mlflow_logging=cfg.logger.mlflow_logging,
+    #     log_to_stdout=cfg.logger.log_to_stdout,
+    # )
 
     best_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
@@ -79,11 +86,11 @@ def main(cfg: DictConfig) -> None:
 
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
-        target_size=cfg.training.target_size,
+        normalize=cfg.transforms.normalize,
     )
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
-        target_size=cfg.training.target_size,
+        normalize=cfg.transforms.normalize,
     )
     gpu_tr_transforms = instantiate(cfg.transforms._gpu_tr_transforms, ndim=len(cfg.training.target_size))
 
@@ -94,32 +101,32 @@ def main(cfg: DictConfig) -> None:
         train_transforms=cpu_tr_transforms,
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
-        test_transforms=CPU_clsreg_val_test_transforms_crop(target_size=cfg.training.target_size),
+        test_transforms=CPU_vit_val_test_transforms(normalize=cfg.transforms.normalize),
     )
 
     model = instantiate(
         cfg.model._cls_net,
-        input_channels=file_store.dataset_json["metadata"]["n_modalities"],
-        output_channels=file_store.dataset_json["metadata"]["n_classes"],
+        num_classes=file_store.dataset_json["metadata"]["n_classes"],
     )
 
     model_module = instantiate(
         cfg.lightning._lightning_module,
         model=model,
-        warmup_epochs=cfg.training.warmup_epochs,
-        decoder_warmup_epochs=cfg.training.decoder_warmup_epochs,
+        learning_rate=cfg.model.finetune_lr,
+        minimum_lr=cfg.model.minimum_lr,
+        warmup_ratio=cfg.model.warmup_ratio,
+        cosine_period_ratio=cfg.model.cosine_period_ratio,
+        optimizer=cfg.model.finetune_optim,
+        weight_decay=cfg.model.weight_decay,
+        weights=weights,
+        compile_mode=None,
         train_transforms=gpu_tr_transforms,
         val_transforms=None,
-        weights=weights,
         log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
-        optimizer=cfg.model.finetune_optim,
-        learning_rate=cfg.model.finetune_lr,
-        load_decoder=cfg.training.load_decoder,
-        repeat_stem_weights=cfg.training.repeat_stem_weights,
         test_output_path=os.path.join(
             path_store.run_dir,
             "predictions",
-            cfg.test_task + "__" + cfg.data.test_split + "__" + "best.json",
+            cfg.test_task + (("__" + cfg.data.test_split) if cfg.data.test_split else "") + "__" + "best.json",
         ),
     )
 
@@ -132,7 +139,7 @@ def main(cfg: DictConfig) -> None:
             lr_monitor_callback,
         ],
         log_every_n_steps=cfg.logger.log_every_n_steps,
-        logger=loggers,
+        # logger=loggers,
         profiler=profilers,
         default_root_dir=path_store.run_dir,
         max_epochs=cfg.training.epochs,

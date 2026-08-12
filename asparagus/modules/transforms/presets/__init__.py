@@ -23,6 +23,11 @@ from .braindino_transforms import (
     braindino_GPU_val_transforms
 )
 
+from .vit_transforms import (
+    CPU_vit_train_transforms,
+    CPU_vit_val_test_transforms
+)
+
 __all__ = [
     "none",
     "CPU_clsreg_train_transforms_crop",
@@ -41,4 +46,6 @@ __all__ = [
     "braindino_CPU_val_transforms",
     "braindino_GPU_train_transforms",
     "braindino_GPU_val_transforms",
+    "CPU_vit_train_transforms",
+    "CPU_vit_val_test_transforms",
 ]

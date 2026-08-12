@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - /subjectwise_finetune_cls
+  - /model/braindino_vit_b@model
+  - _self_
+
+task:
+root: lesion_impossible
+stem: finetune
+
+checkpoint_run_id:

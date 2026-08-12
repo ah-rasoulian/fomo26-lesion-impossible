@@ -681,53 +681,6 @@ class BrainDinoViT(nn.Module):
         }
 
 
-class ViTTaskModel(nn.Module):
-    """
-    Thin downstream wrapper.
-
-    Classification/regression use CLS. A segmentation decoder receives the
-    complete ViTFeatures object, so it can use the final map and intermediate
-    maps for skip connections.
-    """
-
-    def __init__(
-        self,
-        backbone: SpacingAwareViT3d,
-        output_channels: int,
-        task: Literal["classification", "regression", "segmentation"],
-        decoder: Optional[nn.Module] = None,
-    ) -> None:
-        super().__init__()
-        self.backbone = backbone
-        self.task = task
-        if task in {"classification", "regression"}:
-            if decoder is not None:
-                raise ValueError(f"{task} does not use a decoder.")
-            self.head: Optional[nn.Module] = nn.Linear(
-                backbone.embed_dim, output_channels
-            )
-            self.decoder = None
-        elif task == "segmentation":
-            if decoder is None:
-                raise ValueError("A segmentation decoder must be supplied.")
-            self.head = None
-            self.decoder = decoder
-        else:
-            raise ValueError(f"Unsupported task: {task}.")
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        spacing: torch.Tensor,
-        modality: Optional[torch.Tensor] = None,
-        channel_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        features = self.backbone.forward_features(x, spacing, modality, channel_mask)
-        if self.task == "segmentation":
-            return self.decoder(features, output_size=x.shape[2:])
-        return self.head(features.cls)
-
-
 def pretrain_braindino_vit_s(
     patch_kernel_size: int,
     patch_stride: int,
@@ -975,19 +928,6 @@ def main() -> None:
         pretraining_outputs,
     )
     print(f"  masked patches per sample: {patch_mask.sum(dim=1).cpu().tolist()}")
-
-    classification_model = ViTTaskModel(
-        backbone=backbone,
-        output_channels=3,
-        task="classification",
-    ).to(device)
-    classification_model.eval()
-
-    with torch.inference_mode():
-        logits = classification_model(x, spacing, modality)
-    print("\nClassification output")
-    print(f"  logits: {tuple(logits.shape)}")
-    print(f"  values:\n{logits.cpu()}")
 
 
 if __name__ == "__main__":

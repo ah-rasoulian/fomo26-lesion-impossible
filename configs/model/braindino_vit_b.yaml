@@ -4,6 +4,9 @@ defaults:
 dimensions: 3D
 
 pretrain_net: pretrain_braindino_vit_b
+seg_net: task_vit_b_seg
+cls_net: task_vit_b_cls
+reg_net: task_vit_b_reg
 
 patch_kernel_size: 9
 patch_stride: 8
@@ -15,12 +18,5 @@ learn_sigma: true
 cls_projection_dim: 65536
 patch_projection_dim: 8192
 
-seg_net:
-cls_net:
-
 plugin_seg_net:
 plugin_seg_train_n_last_params:
-
-# Dropout rates (0.0 = no dropout)
-encoder_dropout_rate: 0.0
-decoder_dropout_rate: 0.0

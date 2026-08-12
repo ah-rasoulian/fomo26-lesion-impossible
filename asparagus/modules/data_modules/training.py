@@ -84,25 +84,20 @@ class SegDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=False,
             drop_last=True,
             sampler=sampler,
         )
 
     def val_dataloader(self):
-        sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
-        if dist.is_initialized():
-            sampler = DistributedSamplerWrapper(sampler)
-
         return DataLoader(
             self.val_dataset,
             num_workers=self.num_workers,
             batch_size=self.batch_size,
-            pin_memory=False,
+            pin_memory=True,
             shuffle=False,
-            persistent_workers=True,
-            drop_last=True,
-            sampler=sampler,
+            persistent_workers=False,
+            drop_last=False,
         )
 
     def test_dataloader(self):
@@ -111,7 +106,7 @@ class SegDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             batch_size=1,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=False,
             collate_fn=collate_return,
         )
 
@@ -195,27 +190,21 @@ class ClsRegDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=False,
             drop_last=True,
             shuffle=sampler is None,
             sampler=sampler,
         )
 
     def val_dataloader(self):
-        sampler = None
-        if self.use_random_datasampler:
-            sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
-            sampler = DistributedSamplerWrapper(sampler) if dist.is_initialized() else sampler
-
         return DataLoader(
             self.val_dataset,
-            num_workers=self.num_workers // 2,
+            num_workers=self.num_workers,
             batch_size=self.batch_size,
-            pin_memory=False,
-            persistent_workers=True,
-            drop_last=False,
-            sampler=sampler,
+            pin_memory=True,
             shuffle=False,
+            persistent_workers=False,
+            drop_last=False,
         )
 
     def test_dataloader(self):
@@ -224,7 +213,7 @@ class ClsRegDataModule(pl.LightningDataModule):
             num_workers=1,
             batch_size=1,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=False,
             collate_fn=collate_return,
         )
 

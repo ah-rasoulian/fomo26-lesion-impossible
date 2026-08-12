@@ -3,6 +3,7 @@ from .linear_probe_module import LinearProbeModule
 from .segmentation_module import SegmentationModule
 from .self_supervised import SelfSupervisedModule
 from .braindino_module import BrainDinoModule
+from .vit_clsreg_module import ViTClassificationModule, ViTRegressionModule
 
 __all__ = [
     "SegmentationModule",
@@ -11,4 +12,6 @@ __all__ = [
     "SelfSupervisedModule",
     "LinearProbeModule",
     "BrainDinoModule",
+    "ViTClassificationModule",
+    "ViTRegressionModule",
 ]
