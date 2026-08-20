@@ -39,7 +39,7 @@ def _ensure_image_shape(
     file: str,
 ) -> torch.Tensor:
     """
-    Ensure that an image follows the [C, D, H, W] convention.
+    Ensure that an image follows the [C, H, W, D] convention.
     """
     image = torch.as_tensor(image).float()
 
@@ -48,7 +48,7 @@ def _ensure_image_shape(
 
     if image.ndim != 4:
         raise RuntimeError(
-            f"Expected image with shape [C, D, H, W], but {file} "
+            f"Expected image with shape [C, H, W, D], but {file} "
             f"produced shape {tuple(image.shape)}."
         )
 
@@ -60,7 +60,7 @@ def _ensure_label_shape(
     file: str,
 ) -> torch.Tensor:
     """
-    Ensure that a segmentation label follows [C, D, H, W].
+    Ensure that a segmentation label follows [C, H, W, D].
     """
     label = torch.as_tensor(label).float()
 
@@ -69,7 +69,7 @@ def _ensure_label_shape(
 
     if label.ndim != 4:
         raise RuntimeError(
-            f"Expected segmentation label with shape [C, D, H, W], "
+            f"Expected segmentation label with shape [C, H, W, D], "
             f"but {file} produced shape {tuple(label.shape)}."
         )
 
@@ -183,7 +183,7 @@ class SegDataset(BaseTaskDataset):
         if data.ndim != 4:
             raise RuntimeError(
                 f"Expected packed segmentation data with shape "
-                f"[C + 1, D, H, W], but {file} produced "
+                f"[C + 1, H, W, D], but {file} produced "
                 f"{tuple(data.shape)}."
             )
 
@@ -276,7 +276,7 @@ class SegTestDataset(BaseTaskDataset):
         if data.ndim != 4 or data.shape[0] < 2:
             raise RuntimeError(
                 f"Expected packed segmentation data with shape "
-                f"[C + 1, D, H, W], but {file} produced "
+                f"[C + 1, H, W, D], but {file} produced "
                 f"{tuple(data.shape)}."
             )
 
@@ -334,7 +334,7 @@ class SegTestDataset(BaseTaskDataset):
 
         src_label_npy = nifti_or_np_to_np(src_label_nii)
 
-        # Preserve the existing [1, 1, D, H, W] convention used by
+        # Preserve the existing [1, 1, H, W, D] convention used by
         # downstream test-time restoration/evaluation.
         return torch.from_numpy(src_label_npy).float().unsqueeze(0).unsqueeze(0)
 
