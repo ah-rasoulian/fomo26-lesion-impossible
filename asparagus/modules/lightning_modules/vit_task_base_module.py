@@ -35,6 +35,7 @@ class ViTTaskBaseModule(L.LightningModule):
             self,
             model: ViTTaskModel,
             learning_rate: float = 1e-4,
+            backbone_lr_multiplier: float = 0.01,
 
             # Retained only because BaseModule expects it.
             warmup_epochs: int = 0,
@@ -66,6 +67,11 @@ class ViTTaskBaseModule(L.LightningModule):
         if not 0.0 < warmup_ratio < 1.0:
             raise ValueError("warmup_ratio must be in (0, 1).")
 
+        if not 0.0 < backbone_lr_multiplier <= 1.0:
+            raise ValueError(
+                "backbone_lr_multiplier must be in (0, 1]."
+            )
+
         if not 0.0 < cosine_period_ratio <= 1.0:
             raise ValueError(
                 "cosine_period_ratio must be in (0, 1]."
@@ -86,6 +92,7 @@ class ViTTaskBaseModule(L.LightningModule):
 
         self.model = model
         self.learning_rate = float(learning_rate)
+        self.backbone_lr_multiplier = float(backbone_lr_multiplier)
         self.warmup_ratio = float(warmup_ratio)
         self.cosine_period_ratio = float(
             cosine_period_ratio
@@ -122,6 +129,17 @@ class ViTTaskBaseModule(L.LightningModule):
                 self.model,
                 mode=compile_mode,
             )
+
+    def on_train_epoch_start(self):
+        model = self.unwrap_compiled_model()
+
+        backbone_is_frozen = not any(
+            parameter.requires_grad
+            for parameter in model.backbone.parameters()
+        )
+
+        if backbone_is_frozen:
+            model.backbone.eval()
 
     @abstractmethod
     def training_step(self, batch, batch_idx):
@@ -278,7 +296,7 @@ class ViTTaskBaseModule(L.LightningModule):
             groups.append(
                 {
                     "params": backbone_parameters,
-                    "lr": self.learning_rate,
+                    "lr": self.learning_rate * self.backbone_lr_multiplier,
                     "name": "backbone",
                 }
             )
