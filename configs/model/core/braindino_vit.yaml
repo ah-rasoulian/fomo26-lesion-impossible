@@ -15,6 +15,7 @@ _seg_net:
   patch_padding: ${model.patch_padding}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  freeze_backbone: ${model.freeze_backbone}
 
 _cls_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.cls_net}
@@ -23,8 +24,7 @@ _cls_net:
   patch_padding: ${model.patch_padding}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
-
-  dropout: 0.25
+  freeze_backbone: ${model.freeze_backbone}
 
 _reg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.reg_net}
@@ -33,11 +33,13 @@ _reg_net:
   patch_padding: ${model.patch_padding}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  freeze_backbone: ${model.freeze_backbone}
 
 _plugin_seg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.plugin_seg_net}
   dimensions: ${model.dimensions}
 
+ckpt_every_n_epoch: 5
 recovery_ckpt_every_n_optimizer_steps: 1000
 snapshot_ckpt_every_n_optimizer_steps: 10000
 
@@ -54,5 +56,5 @@ train_lr: 1e-2
 nesterov: True
 momentum: 0.99
 
-finetune_optim: AdamW
+finetune_optim: SGD
 finetune_lr: 1e-3

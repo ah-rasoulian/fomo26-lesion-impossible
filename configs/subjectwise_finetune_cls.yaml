@@ -1,6 +1,6 @@
 defaults:
   - core/base@
-  - hardware/1gpu40cpu@hardware
+  - hardware/1gpu12cpu@hardware
   - _self_
 
 task:
@@ -12,7 +12,7 @@ stem: ${checkpoint_run_id}_${load_checkpoint_name}
 
 model:
   net: ${model.cls_net}
-  ckpt_every_n_epoch: 25
+  freeze_backbone: False
 
 lightning:
   data_module: ClsRegDataModule
@@ -20,19 +20,25 @@ lightning:
 
 data:
   data_path: ${oc.env:ASPARAGUS_DATA}/${task}
-  train_split: split_75_25_00
+  train_split: split_80_20_00
   fold: 0
 
 training:
-  epochs: 50
+  epochs: 100
   warmup_epochs:
   batch_size: 1
-  limit_train_batches: 250
-  limit_val_batches: 50
-  target_size: [128, 128, 128]
-  seed: ${random:0,1000000}
-  check_val_every_n_epoch: 3
-  accumulate_grad_batches: 1
+  seed: 1998
+
+  steps_per_epoch: 250
+  val_steps_per_epoch: 1.0
+
+  target_size: [ 128, 128, 128 ]
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 32
+
+  use_class_weights: true
+  class_weight_power: 0.5
+  label_smoothing: 0.0
 
 transforms:
   cpu_tr_transforms: CPU_vit_train_transforms
