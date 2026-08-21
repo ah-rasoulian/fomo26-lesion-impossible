@@ -390,49 +390,78 @@ class ClsRegDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         sampler = None
-        if self.use_random_datasampler:
-            sampler = RandomSampler(self.train_dataset, num_samples=999999, replacement=True)
-            sampler = DistributedSamplerWrapper(sampler) if dist.is_initialized() else sampler
 
-        return DataLoader(
-            self.train_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=False,
-            persistent_workers=False,
-            drop_last=True,
-            shuffle=sampler is None,
-            sampler=sampler,
-        )
+        if self.use_random_datasampler:
+            sampler = RandomSampler(
+                self.train_dataset,
+                num_samples=999999,
+                replacement=True,
+            )
+
+            if dist.is_initialized():
+                sampler = DistributedSamplerWrapper(sampler)
+
+        loader_kwargs = {
+            "dataset": self.train_dataset,
+            "num_workers": self.num_workers,
+            "batch_size": self.batch_size,
+            "pin_memory": True,
+            "persistent_workers": self.num_workers > 0,
+            "drop_last": True,
+            "shuffle": sampler is None,
+            "sampler": sampler,
+        }
+
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+
+        return DataLoader(**loader_kwargs)
 
     def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=True,
-            shuffle=False,
-            persistent_workers=False,
-            drop_last=False,
-        )
+        loader_kwargs = {
+            "dataset": self.val_dataset,
+            "num_workers": self.num_workers,
+            "batch_size": self.batch_size,
+            "pin_memory": True,
+            "persistent_workers": self.num_workers > 0,
+            "drop_last": False,
+            "shuffle": False,
+        }
+
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+
+        return DataLoader(**loader_kwargs)
 
     def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            num_workers=1,
-            batch_size=1,
-            pin_memory=False,
-            persistent_workers=False,
-            collate_fn=collate_return,
-        )
+        loader_kwargs = {
+            "dataset": self.test_dataset,
+            "num_workers": self.num_workers,
+            "batch_size": 1,
+            "pin_memory": True,
+            "persistent_workers": self.num_workers > 0,
+            "collate_fn": collate_return,
+        }
+
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+
+        return DataLoader(**loader_kwargs)
 
     def predict_dataloader(self):
-        return DataLoader(
-            self.predict_dataset,
-            num_workers=self.num_workers,
-            batch_size=1,
-            collate_fn=collate_return,
-        )
+        loader_kwargs = {
+            "dataset": self.predict_dataset,
+            "num_workers": self.num_workers,
+            "batch_size": 1,
+            "pin_memory": True,
+            "persistent_workers": self.num_workers > 0,
+            "collate_fn": collate_return,
+        }
+
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+
+        return DataLoader(**loader_kwargs)
 
 
 if __name__ == "__main__":
