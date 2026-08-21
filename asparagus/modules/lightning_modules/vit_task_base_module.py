@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from asparagus.functional.lr_scheduling import (
-    cosine_decay_schedule,
     simple_warmup_cosine_decay_schedule,
 )
 from asparagus.functional.visualization import (
@@ -23,12 +22,16 @@ from torchvision import transforms
 
 
 class ViTTaskBaseModule(L.LightningModule):
-    """Lightning base for sliding-window ViT task models.
+    """Lightning base for full-volume ViT task models.
 
     This class deliberately does not override ``load_state_dict``. Lightning
     can therefore restore a downstream-training checkpoint normally. Transfer
     from a BrainDINO checkpoint is handled separately by
     ``load_pretrained_weights`` and loads only the pretrained backbone.
+
+    During downstream training, the task head and only the final two
+    transformer blocks are trainable. Patch embedding, positional encoding,
+    earlier transformer blocks, and final backbone normalization stay frozen.
     """
 
     def __init__(
@@ -124,22 +127,74 @@ class ViTTaskBaseModule(L.LightningModule):
                 min_load_fraction=min_backbone_load_fraction,
             )
 
+        # Apply this after loading the pretrained state and before compilation.
+        # This policy intentionally overrides the backbone-wide freeze setting
+        # used when the task model was constructed.
+        self._unfreeze_last_backbone_blocks(number_of_blocks=2)
+
         if compile_mode is not None:
             self.model = torch.compile(
                 self.model,
                 mode=compile_mode,
             )
 
-    def on_train_epoch_start(self):
+    def _unfreeze_last_backbone_blocks(
+        self,
+        number_of_blocks: int = 2,
+    ) -> None:
         model = self.unwrap_compiled_model()
+        backbone = model.backbone
 
-        backbone_is_frozen = not any(
-            parameter.requires_grad
-            for parameter in model.backbone.parameters()
+        if not hasattr(backbone, "blocks"):
+            raise AttributeError(
+                "The backbone must expose transformer blocks as `blocks`."
+            )
+        if len(backbone.blocks) < number_of_blocks:
+            raise ValueError(
+                f"Cannot unfreeze {number_of_blocks} blocks from a backbone "
+                f"containing only {len(backbone.blocks)} blocks."
+            )
+
+        # Freeze the complete pretrained backbone first so no patch embedding,
+        # positional encoding, normalization, or earlier-block parameters are
+        # accidentally optimized.
+        for parameter in backbone.parameters():
+            parameter.requires_grad_(False)
+
+        for block in backbone.blocks[-number_of_blocks:]:
+            for parameter in block.parameters():
+                parameter.requires_grad_(True)
+
+        trainable = sum(
+            parameter.numel()
+            for parameter in backbone.parameters()
+            if parameter.requires_grad
+        )
+        total = sum(parameter.numel() for parameter in backbone.parameters())
+        logging.info(
+            "Fine-tuning the final %d/%d transformer blocks: "
+            "%d/%d (%.2f%%) backbone parameters are trainable.",
+            number_of_blocks,
+            len(backbone.blocks),
+            trainable,
+            total,
+            100.0 * trainable / max(1, total),
         )
 
-        if backbone_is_frozen:
-            model.backbone.eval()
+    def _set_partial_backbone_train_mode(self) -> None:
+        """Keep frozen modules deterministic while training the last blocks."""
+        backbone = self.unwrap_compiled_model().backbone
+        backbone.eval()
+        for block in backbone.blocks[-2:]:
+            block.train()
+
+    def on_train_start(self) -> None:
+        self._set_partial_backbone_train_mode()
+
+    def on_train_epoch_start(self) -> None:
+        # Validation sets the full model to eval mode. Restore training mode
+        # only for the two trainable blocks at the beginning of every epoch.
+        self._set_partial_backbone_train_mode()
 
     @abstractmethod
     def training_step(self, batch, batch_idx):
@@ -157,10 +212,10 @@ class ViTTaskBaseModule(L.LightningModule):
 
     def forward_batch(self, batch: Mapping[str, Any]) -> torch.Tensor:
         x = batch["image"]
-        if x.ndim != 5 or x.shape[0] != 1:
+        if x.ndim != 5:
             raise ValueError(
-                "ViTTaskModel requires image [1, C, H, W, D]; "
-                f"received {tuple(x.shape)}. Set batch_size=1."
+                "ViTTaskModel requires image [B, C, D, H, W]; "
+                f"received {tuple(x.shape)}."
             )
 
         info = batch["info"]
@@ -189,73 +244,147 @@ class ViTTaskBaseModule(L.LightningModule):
         checkpoint: Mapping[str, Any],
         min_load_fraction: float = 0.95,
     ) -> None:
-        """Load only SpacingAwareViT3d weights from a BrainDINO checkpoint."""
+        """Load the teacher ViT backbone from a BrainDINO checkpoint.
+
+        The EMA teacher is preferred for downstream initialization, following
+        DINOv2. The student is used only when the checkpoint contains no teacher
+        backbone, such as older or student-only checkpoints. Standalone backbone
+        checkpoints are also supported.
+        """
         if not 0.0 < min_load_fraction <= 1.0:
             raise ValueError("min_load_fraction must be in (0, 1].")
 
         source = self._unwrap_checkpoint_state(checkpoint)
         backbone = self.unwrap_compiled_model().backbone
         target = backbone.state_dict()
-        mapped = {}
-        mapped_priority = {}
-        wrong_shape = []
+
+        candidates = {
+            "teacher": {},
+            "student": {},
+            "standalone": {},
+        }
+        wrong_shapes = {
+            "teacher": [],
+            "student": [],
+            "standalone": [],
+        }
 
         for original_key, value in source.items():
             if not isinstance(value, torch.Tensor):
                 continue
+
             key = self._remove_compile_prefix(original_key)
 
-            # A full SSL checkpoint may contain both networks. Downstream
-            # checkpoints are initialized from the saved student, never allow a
-            # teacher entry encountered later to overwrite it.
-            if ".teacher." in key or key.startswith("teacher."):
-                continue
-            priority = 2 if (".student." in key or key.startswith("student.")) else 1
+            if ".teacher.backbone." in key:
+                source_name = "teacher"
+                backbone_key = key.split(
+                    ".teacher.backbone.", maxsplit=1
+                )[1]
+            elif key.startswith("teacher.backbone."):
+                source_name = "teacher"
+                backbone_key = key.removeprefix("teacher.backbone.")
 
-            if ".backbone." in key:
+            elif ".student.backbone." in key:
+                source_name = "student"
+                backbone_key = key.split(
+                    ".student.backbone.", maxsplit=1
+                )[1]
+            elif key.startswith("student.backbone."):
+                source_name = "student"
+                backbone_key = key.removeprefix("student.backbone.")
+
+            elif ".backbone." in key:
+                source_name = "standalone"
                 backbone_key = key.split(".backbone.", maxsplit=1)[1]
             elif key.startswith("backbone."):
+                source_name = "standalone"
                 backbone_key = key.removeprefix("backbone.")
             else:
                 continue
 
             if backbone_key not in target:
                 continue
+
             if target[backbone_key].shape != value.shape:
-                wrong_shape.append(
-                    (backbone_key, tuple(value.shape), tuple(target[backbone_key].shape))
+                wrong_shapes[source_name].append(
+                    (
+                        backbone_key,
+                        tuple(value.shape),
+                        tuple(target[backbone_key].shape),
+                    )
                 )
                 continue
-            if priority < mapped_priority.get(backbone_key, 0):
-                continue
-            mapped[backbone_key] = value
-            mapped_priority[backbone_key] = priority
 
+            candidates[source_name][backbone_key] = value
+
+        # Select one network as a whole. Never mix teacher and student parameters.
+        if candidates["teacher"]:
+            selected_source = "teacher"
+        elif candidates["student"]:
+            selected_source = "student"
+            logging.warning(
+                "No teacher backbone was found in the BrainDINO checkpoint. "
+                "Falling back to the student backbone."
+            )
+        elif candidates["standalone"]:
+            selected_source = "standalone"
+            logging.warning(
+                "The checkpoint does not identify its backbone as teacher or "
+                "student. Loading the standalone backbone."
+            )
+        else:
+            raise RuntimeError(
+                "No compatible teacher, student, or standalone backbone entries "
+                "were found in the BrainDINO checkpoint."
+            )
+
+        mapped = candidates[selected_source]
         missing = sorted(set(target) - set(mapped))
         loaded_fraction = len(mapped) / max(1, len(target))
+
         if loaded_fraction < min_load_fraction:
             raise RuntimeError(
-                "Only "
-                f"{len(mapped)}/{len(target)} ({loaded_fraction:.1%}) backbone "
-                "entries matched the BrainDINO checkpoint. "
+                f"Only {len(mapped)}/{len(target)} ({loaded_fraction:.1%}) "
+                f"backbone entries matched the {selected_source} network in the "
+                "BrainDINO checkpoint. "
                 f"First missing keys: {missing[:10]}; "
-                f"first shape mismatches: {wrong_shape[:5]}."
+                "first shape mismatches: "
+                f"{wrong_shapes[selected_source][:5]}."
             )
 
         incompatible = backbone.load_state_dict(mapped, strict=False)
+
         if incompatible.unexpected_keys:
             raise RuntimeError(
-                f"Unexpected mapped backbone keys: {incompatible.unexpected_keys}."
+                "Unexpected mapped backbone keys: "
+                f"{incompatible.unexpected_keys}."
             )
+
+        # This should agree with `missing`, but use PyTorch's result as a final
+        # consistency check.
+        if sorted(incompatible.missing_keys) != missing:
+            raise RuntimeError(
+                "Backbone loading produced an inconsistent missing-key report. "
+                f"Expected {missing[:10]}, but load_state_dict reported "
+                f"{sorted(incompatible.missing_keys)[:10]}."
+            )
+
         logging.info(
-            "Loaded %d/%d (%.1f%%) pretrained ViT backbone entries. "
-            "The downstream task head remains newly initialized.",
+            "Loaded %d/%d (%.1f%%) pretrained ViT backbone entries from the "
+            "BrainDINO %s network. The downstream task head remains newly "
+            "initialized.",
             len(mapped),
             len(target),
             100.0 * loaded_fraction,
+            selected_source,
         )
+
         if missing:
-            logging.warning("Missing pretrained backbone entries: %s", missing)
+            logging.warning(
+                "Missing pretrained %s-backbone entries: %s",
+                selected_source,
+                missing,
+            )
 
     def _parameter_groups(self):
         model = self.unwrap_compiled_model()
@@ -297,7 +426,7 @@ class ViTTaskBaseModule(L.LightningModule):
                 {
                     "params": backbone_parameters,
                     "lr": self.learning_rate * self.backbone_lr_multiplier,
-                    "name": "backbone",
+                    "name": "backbone_last_two_blocks",
                 }
             )
 
