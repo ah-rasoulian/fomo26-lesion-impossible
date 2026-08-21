@@ -192,13 +192,13 @@ def get_logger_compatible_image_output_target(image, output, target, task_type: 
             foreground_locations = target[0].nonzero()
             slice_to_visualize = foreground_locations[0][np.random.randint(0, len(foreground_locations[0]))]
         else:
-            slice_to_visualize = np.random.randint(0, image.shape[1])
+            slice_to_visualize = image.shape[-1] // 2
 
-        image = image[:, slice_to_visualize]
+        image = image[..., slice_to_visualize]
         if len(target.shape) == 4:
-            target = target[:, slice_to_visualize]
+            target = target[..., slice_to_visualize]
         if len(output.shape) == 4:
-            output = output[:, slice_to_visualize]
+            output = output[..., slice_to_visualize]
 
     image = normalize_array_to_pil(image[channel_idx])
 
