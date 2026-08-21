@@ -50,19 +50,19 @@ def main(cfg: DictConfig) -> None:
     weights = resolve_checkpoint(cfg)
     pl.seed_everything(seed=cfg.training.seed, workers=True)
 
-    # loggers = logging(
-    #     ckpt_wandb_id=version_store.wandb_id,
-    #     ckpt_mlflow_id=version_store.mlflow_id,
-    #     log_file_name=HydraConfig.get().job.name,
-    #     run_dir=path_store.run_dir,
-    #     version=version_store.version,
-    #     wandb_config=logging_safe_cfg,
-    #     wandb_experiment=HydraConfig.get().job.config_name,
-    #     wandb_project=cfg.logger.wandb_project,
-    #     wandb_logging=cfg.logger.wandb_logging,
-    #     mlflow_logging=cfg.logger.mlflow_logging,
-    #     log_to_stdout=cfg.logger.log_to_stdout,
-    # )
+    loggers = logging(
+        ckpt_wandb_id=version_store.wandb_id,
+        ckpt_mlflow_id=version_store.mlflow_id,
+        log_file_name=HydraConfig.get().job.name,
+        run_dir=path_store.run_dir,
+        version=version_store.version,
+        wandb_config=logging_safe_cfg,
+        wandb_experiment=HydraConfig.get().job.config_name,
+        wandb_project=cfg.logger.wandb_project,
+        wandb_logging=cfg.logger.wandb_logging,
+        mlflow_logging=cfg.logger.mlflow_logging,
+        log_to_stdout=cfg.logger.log_to_stdout,
+    )
 
     best_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
@@ -87,10 +87,12 @@ def main(cfg: DictConfig) -> None:
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
         normalize=cfg.transforms.normalize,
+        target_size=cfg.training.target_size,
     )
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
         normalize=cfg.transforms.normalize,
+        target_size=cfg.training.target_size,
     )
     gpu_tr_transforms = instantiate(cfg.transforms._gpu_tr_transforms, ndim=len(cfg.training.target_size))
 
@@ -101,13 +103,33 @@ def main(cfg: DictConfig) -> None:
         train_transforms=cpu_tr_transforms,
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
-        test_transforms=CPU_vit_val_test_transforms(normalize=cfg.transforms.normalize),
+        test_transforms=cpu_val_transforms,
+    )
+
+    num_classes = int(
+        file_store.dataset_json["metadata"]["n_classes"]
     )
 
     model = instantiate(
         cfg.model._cls_net,
-        num_classes=file_store.dataset_json["metadata"]["n_classes"],
+        num_classes=num_classes,
     )
+
+    use_class_weights = bool(
+        cfg.training.get("use_class_weights", True)
+    )
+    class_weight_power = float(
+        cfg.training.get("class_weight_power", 0.5)
+    )
+
+    if use_class_weights:
+        loss_weight = data_module.compute_class_weights(
+            num_classes=num_classes,
+            power=class_weight_power,
+        )
+    else:
+        loss_weight = None
+        logging.info("Cross-entropy class weighting is disabled.")
 
     model_module = instantiate(
         cfg.lightning._lightning_module,
@@ -122,11 +144,19 @@ def main(cfg: DictConfig) -> None:
         compile_mode=None,
         train_transforms=gpu_tr_transforms,
         val_transforms=None,
+        loss_weight=loss_weight,
+        label_smoothing=cfg.training.get("label_smoothing", 0.0),
         log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
         test_output_path=os.path.join(
             path_store.run_dir,
             "predictions",
-            cfg.test_task + (("__" + cfg.data.test_split) if cfg.data.test_split else "") + "__" + "best.json",
+            cfg.test_task
+            + (
+                ("__" + cfg.data.test_split)
+                if cfg.data.test_split
+                else ""
+            )
+            + "__best.json",
         ),
     )
 
@@ -139,15 +169,16 @@ def main(cfg: DictConfig) -> None:
             lr_monitor_callback,
         ],
         log_every_n_steps=cfg.logger.log_every_n_steps,
-        # logger=loggers,
+        logger=loggers,
         profiler=profilers,
         default_root_dir=path_store.run_dir,
         max_epochs=cfg.training.epochs,
-        limit_train_batches=cfg.training.limit_train_batches,
-        limit_val_batches=cfg.training.limit_val_batches,
+        limit_train_batches=cfg.training.steps_per_epoch,
+        limit_val_batches=cfg.training.val_steps_per_epoch,
         check_val_every_n_epoch=cfg.training.check_val_every_n_epoch,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         use_distributed_sampler=False,
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(
