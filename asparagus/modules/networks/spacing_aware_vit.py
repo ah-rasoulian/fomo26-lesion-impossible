@@ -232,13 +232,27 @@ class SpacingAwarePatchEmbed3d(nn.Module):
 
         normalized = self.channel_attention_norm(fusion_tokens)
 
-        attended = self.channel_attention(
-            normalized,
-            normalized,
-            normalized,
-            key_padding_mask=padding_mask,
-            need_weights=False,
-        )[0]
+        attention_chunk_size = 4096
+        attended_chunks = []
+
+        for start in range(0, normalized.shape[0], attention_chunk_size):
+            end = min(start + attention_chunk_size, normalized.shape[0])
+
+            chunk = normalized[start:end]
+
+            chunk_padding_mask = padding_mask[start:end] if padding_mask is not None else None
+
+            chunk_attended = self.channel_attention(
+                chunk,
+                chunk,
+                chunk,
+                key_padding_mask=chunk_padding_mask,
+                need_weights=False,
+            )[0]
+
+            attended_chunks.append(chunk_attended)
+
+        attended = torch.cat(attended_chunks, dim=0)
 
         fusion_tokens = fusion_tokens + attended
         fusion_tokens = fusion_tokens + self.channel_attention_mlp(

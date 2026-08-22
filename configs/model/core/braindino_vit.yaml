@@ -56,5 +56,5 @@ train_lr: 1e-2
 nesterov: True
 momentum: 0.99
 
-finetune_optim: SGD
-finetune_lr: 1e-3
+finetune_optim: AdamW
+finetune_lr: 1e-4

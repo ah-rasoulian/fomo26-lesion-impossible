@@ -6,6 +6,6 @@ defaults:
 
 task:
 root: lesion_impossible
-stem: pretrain
+stem: finetune
 
 checkpoint_run_id:

@@ -1,0 +1,151 @@
+Bootstrap: docker
+
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author Amirhossein Rasoulian
+    Challenge FOMO26
+    Task Task 5 - Polymicrogyria Binary Classification
+    Version v2.0.0
+    Description FOMO26 Polymicrogyria 5-Fold ViT Classification Image
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Required by TorchInductor and Triton.
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
+    export CUDAHOSTCXX=/usr/bin/g++
+
+    # Writable runtime compilation caches.
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+
+    # Five-fold model location.
+    export MODEL_DIR=/app/model
+    export CHECKPOINT_NAME=best
+    export NUM_FOLDS=5
+
+    # Required Asparagus paths.
+    export ASPARAGUS_DATA=/input
+    export ASPARAGUS_MODELS=/app/model
+    export ASPARAGUS_RESULTS=/output
+    export ASPARAGUS_CONFIGS=/app/configs
+    export ASPARAGUS_RAW_LABELS=/app/raw_labels
+
+    export ASPARAGUS_PRETRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_TRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_FINETUNE_CONFIGS=/app/configs
+    export ASPARAGUS_EVAL_BOX_CONFIGS=/app/configs
+
+    export WANDB_MODE=disabled
+    export WANDB_SILENT=true
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+
+%files
+    # Build from:
+    # /scratch/01/ahrasoulian/projects/fomo26
+
+    # Challenge entry point.
+    fomo26-lesion-impossible/submission/task5/predict_v2.py /app/predict.py
+
+    # Python requirements.
+    fomo26-lesion-impossible/requirements.txt /app/requirements.txt
+
+    # Required application source and configurations.
+    fomo26-lesion-impossible/asparagus /app/asparagus
+    fomo26-lesion-impossible/configs /app/configs
+
+    # Task 5 cross-validation folds.
+    models/CLS003_FOMO26_Polymicrogyria/task_vit_b_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/v2_cls.yaml__clargs=data.fold=0/split_80_20_00__fold=0/run_id=387258 /app/model/fold_0
+    models/CLS003_FOMO26_Polymicrogyria/task_vit_b_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/v2_cls.yaml__clargs=data.fold=1/split_80_20_00__fold=1/run_id=299246 /app/model/fold_1
+    models/CLS003_FOMO26_Polymicrogyria/task_vit_b_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/v2_cls.yaml__clargs=data.fold=2/split_80_20_00__fold=2/run_id=661404 /app/model/fold_2
+    models/CLS003_FOMO26_Polymicrogyria/task_vit_b_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/v2_cls.yaml__clargs=data.fold=3/split_80_20_00__fold=3/run_id=382275 /app/model/fold_3
+    models/CLS003_FOMO26_Polymicrogyria/task_vit_b_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/v2_cls.yaml__clargs=data.fold=4/split_80_20_00__fold=4/run_id=715849 /app/model/fold_4
+
+%post
+    set -eu
+
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
+    export CUDAHOSTCXX=/usr/bin/g++
+
+    # Triton requires the compiler toolchain at inference time.
+    apt-get update
+
+    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev
+
+    mkdir -p \
+        /app/raw_labels \
+        /tmp/torchinductor_cache \
+        /tmp/triton_cache
+
+    # Keep the PyTorch, Triton, and CUDA packages from the base image.
+    grep -viE \
+        '^[[:space:]]*(torch|torchvision|torchaudio|triton|nvidia-[A-Za-z0-9_.-]+)([<>=!~[:space:]].*)?$' \
+        /app/requirements.txt \
+        > /app/requirements-runtime.txt
+
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --prefer-binary \
+        -r /app/requirements-runtime.txt
+
+    chmod +x /app/predict.py
+
+    # Fail at build time if any fold is incomplete.
+    fold=0
+    while [ "$fold" -lt 5 ]; do
+        test -d "/app/model/fold_${fold}"
+        test -f "/app/model/fold_${fold}/checkpoints/best.ckpt"
+
+        if [ -f "/app/model/fold_${fold}/hydra/config.yaml" ]; then
+            :
+        elif [ -f "/app/model/fold_${fold}/.hydra/config.yaml" ]; then
+            :
+        else
+            echo "Missing Hydra config for fold_${fold}" >&2
+            exit 1
+        fi
+
+        fold=$((fold + 1))
+    done
+
+    # GCC must remain installed for runtime Triton compilation.
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%runscript
+    exec python /app/predict.py "$@"
+
+%help
+    This container runs the FOMO26 Task 5 polymicrogyria binary
+    classification five-fold ViT ensemble.
+
+    Build from /scratch/01/ahrasoulian/projects/fomo26 with:
+
+        singularity build --fakeroot task5_vit_ensemble.sif task5.def
+
+    Usage:
+
+        singularity run --nv \
+            --bind /path/to/input:/input:ro \
+            --bind /path/to/output:/output \
+            task5_vit_ensemble.sif \
+            --t1 /input/t1.nii.gz \
+            --output /output/probability.txt

@@ -29,21 +29,20 @@ training:
   batch_size: 1
   seed: 1998
 
-  steps_per_epoch: 250
+  steps_per_epoch: 100
   val_steps_per_epoch: 1.0
 
   target_size: [ 128, 128, 128 ]
   check_val_every_n_epoch: 1
-  accumulate_grad_batches: 32
+  accumulate_grad_batches: 16
 
-  use_class_weights: true
-  class_weight_power: 0.5
+  focal_gamma: 2.0
   label_smoothing: 0.0
 
 transforms:
   cpu_tr_transforms: CPU_vit_train_transforms
   cpu_val_transforms: CPU_vit_val_test_transforms
-  gpu_tr_transforms: GPU_all_train_transforms
+  gpu_tr_transforms: GPU_vit_all_train_transforms
   gpu_val_transforms:
   normalize: True
 

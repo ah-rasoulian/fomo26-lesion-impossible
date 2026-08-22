@@ -4,23 +4,16 @@ import os
 import random
 from asparagus.functional.versioning import generate_unused_run_id
 from asparagus.modules.hydra.plugins.searchpath_plugins import FinetuneSearchpathPlugin
-from asparagus.modules.transforms.presets import CPU_clsreg_val_test_transforms_crop
 from asparagus.paths import get_config_path
 from asparagus.pipeline.auto_configuration.checkpoint import resolve_checkpoint
-from asparagus.pipeline.auto_configuration.experiment_setup import (
-    prepare_standard_experiment,
-)
+from asparagus.pipeline.auto_configuration.experiment_setup import prepare_standard_experiment
 from asparagus.pipeline.auto_configuration.logging import logging
 from dotenv import load_dotenv
 from gardening_tools.modules.networks.components.weight_init import set_params_to_zero
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.plugins import Plugins
 from hydra.utils import instantiate
-from lightning.pytorch.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-    TQDMProgressBar,
-)
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from omegaconf import DictConfig, OmegaConf
 
 load_dotenv()
@@ -28,6 +21,10 @@ load_dotenv()
 OmegaConf.register_new_resolver("random", lambda min, max: random.randint(min, max))
 OmegaConf.register_new_resolver("version", lambda: generate_unused_run_id(), use_cache=True)
 OmegaConf.register_new_resolver("eval", eval)
+OmegaConf.register_new_resolver(
+    "ceil_div",
+    lambda numerator, denominator: (int(numerator) + int(denominator) - 1) // int(denominator),
+)
 Plugins.instance().register(FinetuneSearchpathPlugin)
 
 
@@ -37,11 +34,25 @@ Plugins.instance().register(FinetuneSearchpathPlugin)
     version_base="1.2",
 )
 def main(cfg: DictConfig) -> None:
-    print(f"{OmegaConf.to_yaml(cfg)}\n Version: {cfg.run_id}\n Run dir: {HydraConfig.get().run.dir}\n")
-    file_store, path_store, version_store = prepare_standard_experiment(cfg)
+    if HydraConfig.get().runtime.output_dir:
+        print(f"Version: {cfg.run_id}")
+        print(f"Run dir: {HydraConfig.get().run.dir}")
+
+    logging_safe_cfg = OmegaConf.to_container(
+        cfg,
+        resolve=True,
+        throw_on_missing=True,
+    )
+
+    file_store, path_store, version_store = (
+        prepare_standard_experiment(cfg)
+    )
     weights = resolve_checkpoint(cfg)
 
-    pl.seed_everything(seed=cfg.training.seed, workers=True)
+    pl.seed_everything(
+        seed=cfg.training.seed,
+        workers=True,
+    )
 
     loggers = logging(
         ckpt_wandb_id=version_store.wandb_id,
@@ -49,8 +60,8 @@ def main(cfg: DictConfig) -> None:
         log_file_name=HydraConfig.get().job.name,
         run_dir=path_store.run_dir,
         version=version_store.version,
+        wandb_config=logging_safe_cfg,
         wandb_experiment=HydraConfig.get().job.config_name,
-        wandb_entity=cfg.logger.wandb_entity,
         wandb_project=cfg.logger.wandb_project,
         wandb_logging=cfg.logger.wandb_logging,
         mlflow_logging=cfg.logger.mlflow_logging,
@@ -65,6 +76,7 @@ def main(cfg: DictConfig) -> None:
         filename="best",
         enable_version_counter=False,
     )
+
     last_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
         every_n_epochs=cfg.model.ckpt_every_n_epoch,
@@ -73,19 +85,31 @@ def main(cfg: DictConfig) -> None:
         enable_version_counter=False,
     )
 
-    progressbar_callback = TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps)
-    lr_monitor_callback = LearningRateMonitor(logging_interval="epoch", log_momentum=True)
-    profilers = None
+    progressbar_callback = TQDMProgressBar(
+        refresh_rate=cfg.logger.log_every_n_steps,
+    )
+
+    lr_monitor_callback = LearningRateMonitor(
+        logging_interval="epoch",
+        log_momentum=True,
+    )
 
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
+        normalize=cfg.transforms.normalize,
         target_size=cfg.training.target_size,
     )
+
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
+        normalize=cfg.transforms.normalize,
         target_size=cfg.training.target_size,
     )
-    gpu_tr_transforms = instantiate(cfg.transforms._gpu_tr_transforms, ndim=len(cfg.training.target_size))
+
+    gpu_tr_transforms = instantiate(
+        cfg.transforms._gpu_tr_transforms,
+        ndim=len(cfg.training.target_size),
+    )
 
     data_module = instantiate(
         cfg.lightning._data_module,
@@ -94,31 +118,42 @@ def main(cfg: DictConfig) -> None:
         train_transforms=cpu_tr_transforms,
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
-        test_transforms=CPU_clsreg_val_test_transforms_crop(target_size=cfg.training.target_size),
+        test_transforms=cpu_val_transforms,
+    )
+
+    num_classes = int(
+        file_store.dataset_json["metadata"]["n_classes"]
     )
 
     model = instantiate(
         cfg.model._cls_net,
-        input_channels=file_store.dataset_json["metadata"]["n_modalities"],
-        output_channels=file_store.dataset_json["metadata"]["n_classes"],
+        num_classes=num_classes,
     )
 
     model_module = instantiate(
         cfg.lightning._lightning_module,
         model=model,
+        learning_rate=cfg.model.finetune_lr,
+        minimum_lr=cfg.model.minimum_lr,
+        warmup_ratio=cfg.model.warmup_ratio,
+        cosine_period_ratio=cfg.model.cosine_period_ratio,
+        optimizer=cfg.model.finetune_optim,
+        weight_decay=cfg.model.weight_decay,
+        weights=weights,
+        compile_mode=None,
         train_transforms=gpu_tr_transforms,
         val_transforms=None,
-        weights=weights,
         log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
-        optimizer=cfg.model.finetune_optim,
-        learning_rate=cfg.model.finetune_lr,
-        warmup_epochs=cfg.training.warmup_epochs,
-        weight_decay=cfg.model.weight_decay,
-        load_decoder=cfg.training.load_decoder,
         test_output_path=os.path.join(
             path_store.run_dir,
             "predictions",
-            cfg.test_task + "__" + cfg.data.test_split + "__" + "best.json",
+            cfg.test_task
+            + (
+                "__" + cfg.data.test_split
+                if cfg.data.test_split
+                else ""
+            )
+            + "__best.json",
         ),
     )
 
@@ -132,13 +167,15 @@ def main(cfg: DictConfig) -> None:
         ],
         log_every_n_steps=cfg.logger.log_every_n_steps,
         logger=loggers,
-        profiler=profilers,
+        profiler=None,
         default_root_dir=path_store.run_dir,
         max_epochs=cfg.training.epochs,
-        limit_train_batches=cfg.training.limit_train_batches,
-        limit_val_batches=cfg.training.limit_val_batches,
+        limit_train_batches=cfg.training.steps_per_epoch,
+        limit_val_batches=cfg.training.val_steps_per_epoch,
         check_val_every_n_epoch=cfg.training.check_val_every_n_epoch,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
+        use_distributed_sampler=False,
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(

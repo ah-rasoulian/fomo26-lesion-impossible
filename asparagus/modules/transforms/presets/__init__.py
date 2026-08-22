@@ -25,7 +25,8 @@ from .braindino_transforms import (
 
 from .vit_transforms import (
     CPU_vit_train_transforms,
-    CPU_vit_val_test_transforms
+    CPU_vit_val_test_transforms,
+    GPU_vit_all_train_transforms,
 )
 
 __all__ = [
@@ -48,4 +49,5 @@ __all__ = [
     "braindino_GPU_val_transforms",
     "CPU_vit_train_transforms",
     "CPU_vit_val_test_transforms",
+    "GPU_vit_all_train_transforms",
 ]

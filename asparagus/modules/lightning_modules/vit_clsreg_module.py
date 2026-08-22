@@ -7,25 +7,23 @@ from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from asparagus.functional.metrics.utils import format_multilabel_metrics
 from asparagus.modules.lightning_modules.vit_task_base_module import (
     ViTTaskBaseModule,
 )
 from gardening_tools.functional.paths.write import save_json
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
-    BinaryAUROC,
-    BinaryAveragePrecision,
     BinaryF1Score,
     BinaryPrecision,
     BinaryRecall,
-    BinarySpecificity,
-    MulticlassAveragePrecision,
+    MulticlassAccuracy,
     MulticlassAUROC,
-    MulticlassF1Score,
+    MulticlassPrecision,
     MulticlassRecall,
 )
 from torchmetrics.regression import MeanAbsoluteError, MeanSquaredError
-import torch.nn.functional as F
 
 
 class ViTClsRegModule(ViTTaskBaseModule):
@@ -47,14 +45,13 @@ class ViTClsRegModule(ViTTaskBaseModule):
 
         task_model = self.unwrap_compiled_model()
         self.num_outputs = self._infer_num_outputs(task_model)
-        # Retain this name for compatibility with the existing configs/code.
+
+        # Retain this name for compatibility with existing configurations.
         self.num_classes = self.num_outputs
         self.ignore_index_in_metrics = -1
         self.task_type = ""
         self.loss: nn.Module
 
-        # Subclasses initialize these only after their task-specific state has
-        # been validated and assigned.
         self.train_metrics: MetricCollection
         self.val_metrics: MetricCollection
         self.test_metrics: MetricCollection
@@ -72,14 +69,15 @@ class ViTClsRegModule(ViTTaskBaseModule):
     def _infer_num_outputs(model: nn.Module) -> int:
         if hasattr(model, "num_classes"):
             return int(model.num_classes)
+
         if hasattr(model, "output_dim"):
             return int(model.output_dim)
 
-        # Supports the current _GlobalTaskHead implementation.
         for head_name in ("classifier", "regressor"):
             head = getattr(model, head_name, None)
             if head is None:
                 continue
+
             for layer in reversed(list(head.modules())):
                 if isinstance(layer, nn.Linear):
                     return int(layer.out_features)
@@ -125,6 +123,7 @@ class ViTClsRegModule(ViTTaskBaseModule):
     ) -> torch.Tensor:
         target = self.prepare_target(batch["CLSREG_label"])
         outputs = self.forward_batch(batch)
+
         self._validate_output_and_target(outputs, target)
         loss = self.compute_loss(outputs, target, stage)
 
@@ -137,9 +136,15 @@ class ViTClsRegModule(ViTTaskBaseModule):
             batch_size=outputs.shape[0],
         )
 
-        metrics = self.train_metrics if stage == "train" else self.val_metrics
+        metrics = (
+            self.train_metrics
+            if stage == "train"
+            else self.val_metrics
+        )
+
         metric_outputs, metric_target = self.prepare_metric_inputs(
-            outputs.detach(), target.detach()
+            outputs.detach(),
+            target.detach(),
         )
         metrics.update(metric_outputs, metric_target)
 
@@ -152,7 +157,13 @@ class ViTClsRegModule(ViTTaskBaseModule):
         ):
             self._log_dict_of_images_to_wandb(
                 {
-                    "input": batch["image"].detach().float().cpu().numpy(),
+                    "input": (
+                        batch["image"]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    ),
                     "target": target.detach().float().cpu().numpy(),
                     "output": outputs.detach().float().cpu().numpy(),
                     "file": batch["file_path"],
@@ -181,27 +192,42 @@ class ViTClsRegModule(ViTTaskBaseModule):
                 "The task model must return [B, num_outputs], got "
                 f"{tuple(outputs.shape)}."
             )
+
         if outputs.shape[1] != self.num_outputs:
             raise ValueError(
-                f"Expected {self.num_outputs} outputs, got {outputs.shape[1]}."
+                f"Expected {self.num_outputs} outputs, "
+                f"got {outputs.shape[1]}."
             )
-        if target.ndim != 2 and self.task_type == "regression":
+
+        if self.task_type == "regression" and target.ndim != 2:
             raise ValueError(
                 "Regression targets must be [B, output_dim], got "
                 f"{tuple(target.shape)}."
             )
+
         if target.shape[0] != outputs.shape[0]:
             raise ValueError(
-                f"Output batch size {outputs.shape[0]} does not match target "
-                f"batch size {target.shape[0]}."
+                f"Output batch size {outputs.shape[0]} does not match "
+                f"target batch size {target.shape[0]}."
             )
-        if not torch.isfinite(outputs).all():
-            raise FloatingPointError("The model produced non-finite outputs.")
 
-    def training_step(self, batch, batch_idx):
+        if not torch.isfinite(outputs).all():
+            raise FloatingPointError(
+                "The model produced non-finite outputs."
+            )
+
+    def training_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+    ) -> torch.Tensor:
         return self._shared_step(batch, batch_idx, "train")
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+    ) -> None:
         self._shared_step(batch, batch_idx, "val")
 
     def _finish_metric_epoch(
@@ -209,12 +235,19 @@ class ViTClsRegModule(ViTTaskBaseModule):
         metrics: MetricCollection,
     ) -> None:
         values = metrics.compute()
-        self.log_dict(
+
+        formatted_values = format_multilabel_metrics(
             values,
+            ignore_index=self.ignore_index_in_metrics,
+        )
+
+        self.log_dict(
+            formatted_values,
             on_step=False,
             on_epoch=True,
             sync_dist=False,
         )
+
         metrics.reset()
 
     def on_train_epoch_end(self) -> None:
@@ -229,67 +262,100 @@ class ViTClsRegModule(ViTTaskBaseModule):
         self.labels = []
         self.test_metrics.reset()
 
-    def test_step(self, batch, batch_idx):
+    def test_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+    ) -> torch.Tensor:
         outputs = self.forward_batch(batch)
         target = self.prepare_target(batch["CLSREG_label"])
+
         self._validate_output_and_target(outputs, target)
+
         metric_outputs, metric_target = self.prepare_metric_inputs(
-            outputs.detach(), target.detach()
+            outputs.detach(),
+            target.detach(),
         )
         self.test_metrics.update(metric_outputs, metric_target)
+
         self._record_test_batch(outputs, target, batch)
         return outputs
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+    def predict_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> torch.Tensor:
         return self.forward_batch(batch)
 
     @staticmethod
     def _file_key(batch: Mapping[str, Any]) -> str:
         file_path = batch["file_path"]
+
         if isinstance(file_path, (list, tuple)):
             return str(file_path[0])
+
         return str(file_path)
 
     def on_test_epoch_end(self) -> None:
         metric_values = self.test_metrics.compute()
+
         metric_values = {
             key: value.detach().cpu().tolist()
             for key, value in metric_values.items()
         }
+
         self.results["metrics"] = metric_values
 
         if self.test_output_path is not None:
             output_directory = os.path.dirname(self.test_output_path)
+
             if output_directory:
                 os.makedirs(output_directory, exist_ok=True)
+
             save_json(self.results, self.test_output_path)
 
         logging.info(
             "Aggregated test results for %d cases: %s",
-            sum(batch.shape[0] for batch in self.predictions),
+            sum(
+                prediction.shape[0]
+                for prediction in self.predictions
+            ),
             metric_values,
         )
+
         self.test_metrics.reset()
 
 
-class MeanWeightedCrossEntropyLoss(nn.Module):
-    """Cross-entropy whose class weights remain effective for batch size one.
+class MulticlassFocalLoss(nn.Module):
+    """Numerically stable multiclass focal loss on raw logits.
 
-    PyTorch's weighted CrossEntropyLoss with reduction="mean" divides by the
-    sum of target weights. With one sample per batch, that normalization
-    cancels the class weight. Here, cross-entropy is computed per sample and
-    then averaged normally.
+    ``weight`` is used as the per-class alpha factor. The losses are
+    averaged over samples without normalization by the sum of target-class
+    weights. Consequently, class weighting remains effective for batch
+    size one.
+
+    Setting ``gamma=0`` recovers mean-weighted cross-entropy.
     """
 
     def __init__(
         self,
         weight: Optional[Sequence[float]] = None,
+        gamma: float = 1.0,
         label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
 
+        if not gamma >= 0.0:
+            raise ValueError(
+                "gamma must be non-negative."
+            )
+
         if not 0.0 <= label_smoothing < 1.0:
-            raise ValueError("label_smoothing must be in [0, 1).")
+            raise ValueError(
+                "label_smoothing must be in [0, 1)."
+            )
 
         if weight is None:
             weight_tensor = None
@@ -300,17 +366,23 @@ class MeanWeightedCrossEntropyLoss(nn.Module):
             ).reshape(-1)
 
             if not torch.isfinite(weight_tensor).all():
-                raise ValueError("All class weights must be finite.")
+                raise ValueError(
+                    "All class weights must be finite."
+                )
+
             if (weight_tensor <= 0).any():
-                raise ValueError("All class weights must be positive.")
+                raise ValueError(
+                    "All class weights must be positive."
+                )
 
         self.register_buffer(
             "weight",
             weight_tensor,
-            # Class weights are derived from the current training fold and
-            # should not create checkpoint incompatibilities across folds.
+            # Class weights may differ between cross-validation folds.
             persistent=False,
         )
+
+        self.gamma = float(gamma)
         self.label_smoothing = float(label_smoothing)
 
     def forward(
@@ -332,14 +404,53 @@ class MeanWeightedCrossEntropyLoss(nn.Module):
                 f"batch size is {target.shape[0]}."
             )
 
-        # Compute unweighted CE first so class weighting can be applied per
-        # sample without CrossEntropyLoss's weighted-mean normalization.
-        sample_losses = F.cross_entropy(
+        if target.numel() > 0:
+            minimum = int(target.min())
+            maximum = int(target.max())
+
+            if minimum < 0 or maximum >= logits.shape[1]:
+                raise ValueError(
+                    "Targets must be valid class indices in "
+                    f"[0, {logits.shape[1] - 1}], got range "
+                    f"[{minimum}, {maximum}]."
+                )
+
+        if (
+            self.weight is not None
+            and self.weight.numel() != logits.shape[1]
+        ):
+            raise ValueError(
+                "weight must contain one value per class: "
+                f"expected {logits.shape[1]}, "
+                f"got {self.weight.numel()}."
+            )
+
+        log_probabilities = F.log_softmax(
+            logits,
+            dim=-1,
+        )
+
+        target_log_probabilities = log_probabilities.gather(
+            dim=1,
+            index=target.unsqueeze(1),
+        ).squeeze(1)
+
+        target_probabilities = target_log_probabilities.exp()
+
+        sample_cross_entropy = F.cross_entropy(
             logits,
             target,
             weight=None,
             reduction="none",
             label_smoothing=self.label_smoothing,
+        )
+
+        focal_factor = (
+            1.0 - target_probabilities
+        ).pow(self.gamma)
+
+        sample_losses = (
+            focal_factor * sample_cross_entropy
         )
 
         if self.weight is not None:
@@ -357,6 +468,7 @@ class ViTClassificationModule(ViTClsRegModule):
         *args,
         label_smoothing: float = 0.0,
         loss_weight: Optional[Sequence[float]] = None,
+        focal_gamma: float = 1.0,
         positive_class_index: int = 1,
         **kwargs,
     ) -> None:
@@ -364,8 +476,8 @@ class ViTClassificationModule(ViTClsRegModule):
 
         if self.num_classes < 2:
             raise ValueError(
-                "ViTClassificationModule uses cross-entropy and therefore "
-                "requires at least two output logits."
+                "ViTClassificationModule requires at least "
+                "two output logits."
             )
 
         if not 0 <= positive_class_index < self.num_classes:
@@ -373,7 +485,9 @@ class ViTClassificationModule(ViTClsRegModule):
                 "positive_class_index is outside the class range."
             )
 
-        self.positive_class_index = int(positive_class_index)
+        self.positive_class_index = int(
+            positive_class_index
+        )
 
         if loss_weight is not None:
             loss_weight = torch.as_tensor(
@@ -388,27 +502,36 @@ class ViTClassificationModule(ViTClsRegModule):
                     f"{loss_weight.numel()}."
                 )
 
-        self.loss = MeanWeightedCrossEntropyLoss(
+        self.loss = MulticlassFocalLoss(
             weight=loss_weight,
+            gamma=focal_gamma,
             label_smoothing=label_smoothing,
         )
-        # Report and monitor natural (unweighted, unsmoothed) validation NLL.
-        # Class weighting is an optimization choice, not an evaluation metric.
+
+        # Monitor natural validation NLL. Class weighting and focal
+        # modulation are optimization choices rather than evaluation metrics.
         self.validation_loss = nn.CrossEntropyLoss()
+
         self.task_type = "classification"
         self._initialize_metrics()
 
-    def prepare_target(self, target: torch.Tensor) -> torch.Tensor:
+    def prepare_target(
+        self,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
         target = target.reshape(-1).long()
+
         if target.numel() > 0:
             minimum = int(target.min())
             maximum = int(target.max())
+
             if minimum < 0 or maximum >= self.num_classes:
                 raise ValueError(
-                    f"Classification targets must be in [0, "
-                    f"{self.num_classes - 1}], got range "
+                    "Classification targets must be in "
+                    f"[0, {self.num_classes - 1}], got range "
                     f"[{minimum}, {maximum}]."
                 )
+
         return target
 
     def compute_loss(
@@ -419,62 +542,43 @@ class ViTClassificationModule(ViTClsRegModule):
     ) -> torch.Tensor:
         if stage == "train":
             return self.loss(outputs, target)
+
         if stage == "val":
             return self.validation_loss(outputs, target)
-        raise ValueError(f"Unsupported stage: {stage}.")
 
-    def configure_metrics(self, prefix: str) -> MetricCollection:
-        if self.num_classes == 2:
-            return MetricCollection(
-                {
-                    f"{prefix}/f1": BinaryF1Score(),
-                    f"{prefix}/auroc": BinaryAUROC(),
-                    f"{prefix}/average_precision": BinaryAveragePrecision(),
-                }
-            )
+        raise ValueError(
+            f"Unsupported stage: {stage}."
+        )
 
+    def configure_metrics(
+        self,
+        prefix: str,
+    ) -> MetricCollection:
         return MetricCollection(
             {
-                f"{prefix}/macro_f1": MulticlassF1Score(
-                    num_classes=self.num_classes, average="macro"
+                f"{prefix}/acc": MulticlassAccuracy(
+                    num_classes=self.num_classes,
+                    average=None,
                 ),
-                f"{prefix}/balanced_accuracy": MulticlassRecall(
-                    num_classes=self.num_classes, average="macro"
-                ),
-                f"{prefix}/macro_auroc": MulticlassAUROC(
-                    num_classes=self.num_classes, average="macro"
-                ),
-                f"{prefix}/macro_average_precision": MulticlassAveragePrecision(
-                    num_classes=self.num_classes, average="macro"
+                f"{prefix}/auroc": MulticlassAUROC(
+                    num_classes=self.num_classes,
+                    average=None,
                 ),
             }
         )
 
-    def configure_test_metrics(self) -> MetricCollection:
-        if self.num_classes == 2:
-            return MetricCollection(
-                {
-                    "F1": BinaryF1Score(),
-                    "AUROC": BinaryAUROC(),
-                    "AveragePrecision": BinaryAveragePrecision(),
-                    "Sensitivity": BinaryRecall(),
-                    "Specificity": BinarySpecificity(),
-                }
-            )
-
+    def configure_test_metrics(
+        self,
+    ) -> MetricCollection:
         return MetricCollection(
             {
-                "MacroF1": MulticlassF1Score(
-                    num_classes=self.num_classes, average="macro"
+                "Precision": MulticlassPrecision(
+                    num_classes=self.num_classes,
+                    average=None,
                 ),
-                "BalancedAccuracy": MulticlassRecall(
-                    num_classes=self.num_classes, average="macro"
-                ),
-                "MacroAUROC": MulticlassAUROC(
-                    num_classes=self.num_classes, average="macro"
-                ),
-                "MacroAveragePrecision": MulticlassAveragePrecision(
-                    num_classes=self.num_classes, average="macro"
+                "Recall": MulticlassRecall(
+                    num_classes=self.num_classes,
+                    average=None,
                 ),
             }
         )
@@ -484,91 +588,148 @@ class ViTClassificationModule(ViTClsRegModule):
         outputs: torch.Tensor,
         target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.num_classes != 2:
-            return outputs, target
+        # Match the default ClsReg module: multiclass metrics receive
+        # [B, C] logits and integer class indices, including when C=2.
+        return outputs, target
 
-        negative_class_index = 1 - self.positive_class_index
-        positive_margin = (
-            outputs[:, self.positive_class_index]
-            - outputs[:, negative_class_index]
-        )
-        binary_target = (target == self.positive_class_index).long()
-        return positive_margin, binary_target
-
-    def _record_test_batch(self, outputs, target, batch) -> None:
+    def _record_test_batch(
+        self,
+        outputs: torch.Tensor,
+        target: torch.Tensor,
+        batch: Mapping[str, Any],
+    ) -> None:
         probabilities = outputs.softmax(dim=-1)
         prediction = outputs.argmax(dim=-1)
+
         file_paths = batch["file_path"]
         if not isinstance(file_paths, (list, tuple)):
             file_paths = [file_paths]
 
         for index, file_path in enumerate(file_paths):
             record = {
-                "prediction": int(prediction[index].detach().cpu()),
-                "probabilities": probabilities[index].detach().cpu().tolist(),
-                "label": int(target[index].detach().cpu()),
+                "prediction": int(
+                    prediction[index].detach().cpu()
+                ),
+                "probabilities": (
+                    probabilities[index]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "label": int(
+                    target[index].detach().cpu()
+                ),
             }
+
             if self.num_classes == 2:
                 record["probability"] = float(
-                    probabilities[index, self.positive_class_index]
+                    probabilities[
+                        index,
+                        self.positive_class_index,
+                    ]
                     .detach()
                     .cpu()
                 )
-            self.results[str(file_path)] = record
-        self.predictions.append(outputs.detach().cpu())
-        self.labels.append(target.detach().cpu())
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+            self.results[str(file_path)] = record
+
+        self.predictions.append(
+            outputs.detach().cpu()
+        )
+        self.labels.append(
+            target.detach().cpu()
+        )
+
+    def predict_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> torch.Tensor:
         logits = self.forward_batch(batch)
         probabilities = logits.softmax(dim=-1)
+
         if self.num_classes == 2:
-            return probabilities[:, self.positive_class_index]
+            return probabilities[
+                :,
+                self.positive_class_index,
+            ]
+
         return probabilities
 
 
 class ViTRegressionModule(ViTClsRegModule):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
+
         self.loss = nn.MSELoss()
         self.task_type = "regression"
         self._initialize_metrics()
 
-    def prepare_target(self, target: torch.Tensor) -> torch.Tensor:
-        # Always retain [B, output_dim], including B=1 and output_dim=1.
-        return target.float().reshape(-1, self.num_outputs)
+    def prepare_target(
+        self,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        # Retain [B, output_dim], including B=1 and output_dim=1.
+        return target.float().reshape(
+            -1,
+            self.num_outputs,
+        )
 
-    def configure_metrics(self, prefix: str) -> MetricCollection:
+    def configure_metrics(
+        self,
+        prefix: str,
+    ) -> MetricCollection:
         return MetricCollection(
             {
-                f"{prefix}/RMSE": MeanSquaredError(
-                    num_outputs=self.num_outputs,
-                    squared=False,
-                ),
-                f"{prefix}/MAE": MeanAbsoluteError(
+                f"{prefix}/MSE": MeanSquaredError(
                     num_outputs=self.num_outputs,
                 ),
             }
         )
 
-    def configure_test_metrics(self) -> MetricCollection:
+    def configure_test_metrics(
+        self,
+    ) -> MetricCollection:
         return MetricCollection(
             {
-                "RMSE": MeanSquaredError(
+                "MSE": MeanSquaredError(
                     num_outputs=self.num_outputs,
-                    squared=False,
                 ),
-                "MAE": MeanAbsoluteError(num_outputs=self.num_outputs),
+                "MAE": MeanAbsoluteError(
+                    num_outputs=self.num_outputs,
+                ),
             }
         )
 
-    def _record_test_batch(self, outputs, target, batch) -> None:
+    def _record_test_batch(
+        self,
+        outputs: torch.Tensor,
+        target: torch.Tensor,
+        batch: Mapping[str, Any],
+    ) -> None:
         file_paths = batch["file_path"]
         if not isinstance(file_paths, (list, tuple)):
             file_paths = [file_paths]
 
         for index, file_path in enumerate(file_paths):
-            prediction_values = outputs[index].detach().cpu().tolist()
-            target_values = target[index].detach().cpu().tolist()
+            prediction_values = (
+                outputs[index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            target_values = (
+                target[index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+
             self.results[str(file_path)] = {
                 "prediction": (
                     prediction_values[0]
@@ -581,19 +742,28 @@ class ViTRegressionModule(ViTClsRegModule):
                     else target_values
                 ),
             }
-        self.predictions.append(outputs.detach().cpu())
-        self.labels.append(target.detach().cpu())
+
+        self.predictions.append(
+            outputs.detach().cpu()
+        )
+        self.labels.append(
+            target.detach().cpu()
+        )
 
 
-def configure_segmentation_metrics(prefix: str) -> MetricCollection:
-    """Metrics for binary foreground segmentation from raw logits.
+def configure_segmentation_metrics(
+    prefix: str,
+) -> MetricCollection:
+    """Configure informative binary segmentation metrics.
 
-    Dice/F1 is the primary overlap measure. Precision and sensitivity expose
-    false-positive and false-negative behavior. Accuracy, specificity, AUROC,
-    average precision, and IoU are omitted: background dominance makes the
-    first two misleading, voxel-ranking metrics do not measure the final mask,
-    and IoU is a monotonic transform of Dice.
+    Dice/F1 is the primary overlap measure. Precision and sensitivity
+    expose false-positive and false-negative behavior.
+
+    Accuracy and specificity are omitted because they are dominated by
+    background voxels. Voxel-level AUROC and average precision are omitted
+    because they measure ranking rather than the final binary mask.
     """
+
     return MetricCollection(
         {
             f"{prefix}/dice": BinaryF1Score(),
@@ -607,17 +777,25 @@ def prepare_segmentation_metric_inputs(
     logits: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert [B, 1, D, H, W] logits/masks to binary metric inputs."""
+    """Prepare binary segmentation logits and targets for TorchMetrics."""
+
     if logits.ndim < 3 or logits.shape[1] != 1:
         raise ValueError(
-            "Binary segmentation logits must be [B, 1, ...], got "
+            "Binary segmentation logits must have shape "
+            "[B, 1, ...], got "
             f"{tuple(logits.shape)}."
         )
+
     if target.ndim == logits.ndim - 1:
         target = target.unsqueeze(1)
+
     if target.shape != logits.shape:
         raise ValueError(
-            f"Target shape {tuple(target.shape)} does not match logits "
-            f"shape {tuple(logits.shape)}."
+            f"Target shape {tuple(target.shape)} does not match "
+            f"logits shape {tuple(logits.shape)}."
         )
-    return logits[:, 0].reshape(-1), target[:, 0].reshape(-1).long()
+
+    metric_logits = logits[:, 0].reshape(-1)
+    metric_target = target[:, 0].reshape(-1).long()
+
+    return metric_logits, metric_target

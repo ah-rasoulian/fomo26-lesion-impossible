@@ -4,23 +4,16 @@ import os
 import random
 from asparagus.functional.versioning import generate_unused_run_id
 from asparagus.modules.hydra.plugins.searchpath_plugins import FinetuneSearchpathPlugin
-from asparagus.modules.transforms.presets import CPU_vit_val_test_transforms
 from asparagus.paths import get_config_path
 from asparagus.pipeline.auto_configuration.checkpoint import resolve_checkpoint
-from asparagus.pipeline.auto_configuration.experiment_setup import (
-    prepare_standard_experiment,
-)
+from asparagus.pipeline.auto_configuration.experiment_setup import prepare_standard_experiment
 from asparagus.pipeline.auto_configuration.logging import logging
 from dotenv import load_dotenv
 from gardening_tools.modules.networks.components.weight_init import set_params_to_zero
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.plugins import Plugins
 from hydra.utils import instantiate
-from lightning.pytorch.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-    TQDMProgressBar,
-)
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from omegaconf import DictConfig, OmegaConf
 
 load_dotenv()
@@ -28,9 +21,9 @@ load_dotenv()
 OmegaConf.register_new_resolver("random", lambda min, max: random.randint(min, max))
 OmegaConf.register_new_resolver("version", lambda: generate_unused_run_id(), use_cache=True)
 OmegaConf.register_new_resolver("eval", eval)
-OmegaConf.register_new_resolver("ceil_div",
-    lambda numerator, denominator: (int(numerator) + int(denominator) - 1)
-    // int(denominator),
+OmegaConf.register_new_resolver(
+    "ceil_div",
+    lambda numerator, denominator: (int(numerator) + int(denominator) - 1) // int(denominator),
 )
 Plugins.instance().register(FinetuneSearchpathPlugin)
 
@@ -45,10 +38,21 @@ def main(cfg: DictConfig) -> None:
         print(f"Version: {cfg.run_id}")
         print(f"Run dir: {HydraConfig.get().run.dir}")
 
-    logging_safe_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    file_store, path_store, version_store = prepare_standard_experiment(cfg)
+    logging_safe_cfg = OmegaConf.to_container(
+        cfg,
+        resolve=True,
+        throw_on_missing=True,
+    )
+
+    file_store, path_store, version_store = (
+        prepare_standard_experiment(cfg)
+    )
     weights = resolve_checkpoint(cfg)
-    pl.seed_everything(seed=cfg.training.seed, workers=True)
+
+    pl.seed_everything(
+        seed=cfg.training.seed,
+        workers=True,
+    )
 
     loggers = logging(
         ckpt_wandb_id=version_store.wandb_id,
@@ -72,6 +76,7 @@ def main(cfg: DictConfig) -> None:
         filename="best",
         enable_version_counter=False,
     )
+
     last_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
         every_n_epochs=cfg.model.ckpt_every_n_epoch,
@@ -80,21 +85,31 @@ def main(cfg: DictConfig) -> None:
         enable_version_counter=False,
     )
 
-    progressbar_callback = TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps)
-    lr_monitor_callback = LearningRateMonitor(logging_interval="epoch", log_momentum=True)
-    profilers = None
+    progressbar_callback = TQDMProgressBar(
+        refresh_rate=cfg.logger.log_every_n_steps,
+    )
+
+    lr_monitor_callback = LearningRateMonitor(
+        logging_interval="epoch",
+        log_momentum=True,
+    )
 
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
         normalize=cfg.transforms.normalize,
         target_size=cfg.training.target_size,
     )
+
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
         normalize=cfg.transforms.normalize,
         target_size=cfg.training.target_size,
     )
-    gpu_tr_transforms = instantiate(cfg.transforms._gpu_tr_transforms, ndim=len(cfg.training.target_size))
+
+    gpu_tr_transforms = instantiate(
+        cfg.transforms._gpu_tr_transforms,
+        ndim=len(cfg.training.target_size),
+    )
 
     data_module = instantiate(
         cfg.lightning._data_module,
@@ -115,22 +130,6 @@ def main(cfg: DictConfig) -> None:
         num_classes=num_classes,
     )
 
-    use_class_weights = bool(
-        cfg.training.get("use_class_weights", True)
-    )
-    class_weight_power = float(
-        cfg.training.get("class_weight_power", 0.5)
-    )
-
-    if use_class_weights:
-        loss_weight = data_module.compute_class_weights(
-            num_classes=num_classes,
-            power=class_weight_power,
-        )
-    else:
-        loss_weight = None
-        logging.info("Cross-entropy class weighting is disabled.")
-
     model_module = instantiate(
         cfg.lightning._lightning_module,
         model=model,
@@ -144,7 +143,8 @@ def main(cfg: DictConfig) -> None:
         compile_mode=None,
         train_transforms=gpu_tr_transforms,
         val_transforms=None,
-        loss_weight=loss_weight,
+        loss_weight=None,
+        focal_gamma=cfg.training.get("focal_gamma", 1.0),
         label_smoothing=cfg.training.get("label_smoothing", 0.0),
         log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
         test_output_path=os.path.join(
@@ -152,7 +152,7 @@ def main(cfg: DictConfig) -> None:
             "predictions",
             cfg.test_task
             + (
-                ("__" + cfg.data.test_split)
+                "__" + cfg.data.test_split
                 if cfg.data.test_split
                 else ""
             )
@@ -170,7 +170,7 @@ def main(cfg: DictConfig) -> None:
         ],
         log_every_n_steps=cfg.logger.log_every_n_steps,
         logger=loggers,
-        profiler=profilers,
+        profiler=None,
         default_root_dir=path_store.run_dir,
         max_epochs=cfg.training.epochs,
         limit_train_batches=cfg.training.steps_per_epoch,
