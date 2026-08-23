@@ -2,12 +2,14 @@ defaults:
   - core/base@
   - _self_
 
-task:
+task: null
 root: base
-stem:
+stem: null
 
 model:
   net: ${model.pretrain_net}
+  # Compatibility with callbacks inherited from core/base. The current
+  # launcher checkpoints by optimizer-step intervals.
   ckpt_every_n_epoch: 5
 
 lightning:
@@ -18,55 +20,99 @@ data:
   data_path: ${oc.env:ASPARAGUS_DATA}/${task}
   train_split: split_99_01_00
   fold: 0
+  train_metadata_cache_path: ${data.data_path}/train_metadata_v2.pkl
+  val_metadata_cache_path: ${data.data_path}/validation_metadata_v2.pkl
 
 training:
-  resume_ckpt:
-  source_patch_size: [ 160, 160, 160 ]
-  global_crop_size: [ 128, 128, 128 ]
-  local_crop_size: [ 64, 64, 64 ]
+  # Empty means train from scratch.
+  resume_ckpt: null
+  # Compatibility with the inherited Lightning-module config. BrainDINO uses
+  # model.warmup_ratio and computes warmup in optimizer steps.
+  warmup_epochs: 0
 
-  mask_ratio: 0.4
+  token_grid_size: [24, 24, 24]
+  # Local views cover a smaller anatomical field of view but are projected
+  # directly by the physical convolution to the same 24^3 token grid.
+  local_crop_size: [96, 96, 96]
+  mask_ratio: 0.5
   n_global_crops: 2
-  n_local_crops: 2
+  n_local_crops: 1
+  # On a 24^3 grid these correspond to approximately 8--64 tokens per block.
+  # The total masked fraction remains controlled independently by mask_ratio.
+  min_mask_block_fraction: 0.0006
+  max_mask_block_fraction: 0.0046
+  max_channels: 4
 
   seed: ${random:0,1000000}
 
-  batch_size: 4
-  accumulate_grad_batches: 8
+  # Full volumes are clamped by the physical convolution before tokenization;
+  # keep two subjects per GPU so KoLeo has a valid neighbour set.
+  # KoLeo needs at least two different subjects in each forward pass;
+  # gradient accumulation cannot provide its nearest-neighbour set.
+  batch_size: 2
+  accumulate_grad_batches: 2
 
-  samples_per_epoch: 20_000
-  physical_global_batch_size: ${eval:"${training.batch_size} * ${hardware.num_devices} * ${hardware.num_nodes}"}
-  effective_global_batch_size: ${eval:"${training.physical_global_batch_size} * ${training.accumulate_grad_batches}"}
-
+  samples_per_epoch: 2_000
+  physical_global_batch_size: ${multiply:${training.batch_size},${hardware.num_devices},${hardware.num_nodes}}
+  effective_global_batch_size: ${multiply:${training.physical_global_batch_size},${training.accumulate_grad_batches}}
   steps_per_epoch: ${ceil_div:${training.samples_per_epoch},${training.physical_global_batch_size}}
 
-  max_samples: 8_000_000
-  steps: ${eval:"${training.max_samples} // ${training.effective_global_batch_size}"}
+  max_samples: 1_000_000
+  steps: ${floor_div:${training.max_samples},${training.effective_global_batch_size}}
 
-  val_steps_per_epoch: 1.0
-  check_val_every_n_epoch: 1
-  warmup_epochs:
+  val_steps_per_epoch: 100
+  check_val_every_n_epoch: 20
+  num_sanity_val_steps: 1
 
 transforms:
   cpu_tr_transforms: braindino_CPU_train_transforms
   cpu_val_transforms: braindino_CPU_val_transforms
   gpu_tr_transforms: braindino_GPU_train_transforms
   gpu_val_transforms: braindino_GPU_val_transforms
-  normalize: True
+
+  _cpu_tr_transforms:
+    _target_: asparagus.modules.transforms.presets.braindino_CPU_train_transforms
+  _cpu_val_transforms:
+    _target_: asparagus.modules.transforms.presets.braindino_CPU_val_transforms
+  _gpu_tr_transforms:
+    _target_: asparagus.modules.transforms.presets.braindino_GPU_train_transforms
+  _gpu_val_transforms:
+    _target_: asparagus.modules.transforms.presets.braindino_GPU_val_transforms
+
+  normalize: true
+  center_crop_fraction: 0.8
+  # Local crops stay near the anatomical center and reject background-only
+  # candidates whenever a crop with sufficient signal is available.
+  local_center_jitter_fraction: 0.10
+  local_min_foreground_fraction: 0.05
+  local_crop_attempts: 8
+  unknown_modality_id: 0
+  channel_drop_probability: 0.20
+  one_unknown_probability: 0.25
+  all_unknown_probability: 0.10
+
+  # Avoid building an enormous affine grid for raw 512^3 volumes before the
+  # physical convolution has a chance to clamp them to its supported range.
+  affine_probability: 0.0
+  rotation_degrees: 10.0
+  scale_range: [0.9, 1.1]
+  translation_fraction: 0.05
+  flip_probability: 0.0
 
 logger:
-  progress_bar: True
-  profile: False
-  wandb_log_model: False
-  wandb_logging: True
-  wandb_entity: ${oc.env:WANDB_ENTITY, "team-asparagus"}
-  wandb_project: Pretrain-ViT
-  mlflow_logging: False
+  progress_bar: true
+  profile: false
+  wandb_log_model: false
+  wandb_logging: true
+  wandb_entity: ${oc.env:WANDB_ENTITY,"team-asparagus"}
+  wandb_project: Pretrain-ViT-v3
+  mlflow_logging: false
   log_every_n_steps: 50
+  visual_log_every_n_steps: 1000
   log_images_every_n_epoch: 5
-  log_to_stdout: False
+  log_to_stdout: false
 
 profiler:
-  enabled: False
+  enabled: false
   profile_every_n_steps: 500
   warmup_steps: 10

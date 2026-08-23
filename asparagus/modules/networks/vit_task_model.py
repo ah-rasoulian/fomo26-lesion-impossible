@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .spacing_aware_vit import SpacingAwareViT3d
+from .braindino_vit import SpacingAwareViT3d
 
 
 def _group_count(channels: int, maximum: int = 8) -> int:

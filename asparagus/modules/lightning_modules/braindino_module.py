@@ -37,13 +37,15 @@ class BrainDinoModule(BaseModule):
 
     The supplied ``model`` owns all architectural details.
 
-    Required model call:
+    Required global-view model call:
 
         output = model(
             x,
             spacing=spacing,
             modality=modality,
-            mask=mask,
+            mask=mask,                       # student only
+            patch_projection_mask=mask,      # student and teacher
+            mode="student" or "teacher",
         )
 
     Required model output:
@@ -52,30 +54,39 @@ class BrainDinoModule(BaseModule):
             "cls_features": Tensor[B, E],
             "patch_features": Tensor[B, N, E],
             "cls_projection": Tensor[B, K_cls],
-            "patch_projection": Tensor[B, N, K_patch],
-            "patch_grid_shape": (D_tokens, H_tokens, W_tokens),
+            "patch_projection": Tensor[M, K_patch],
+            "patch_projection_indices": LongTensor[M, 2],
+            "patch_grid_shape": (H_tokens, W_tokens, D_tokens),
         }
 
     Expected training batch:
 
         {
-            "global_crops": [Tensor[B, C, D, H, W], ...],
-            "local_crops": [Tensor[B, C, D, H, W], ...],
+            "global_crops": [Tensor[B, C, H, W, D], ...],
+            "teacher_global_crops": [Tensor[B, C, H, W, D], ...],
+            "local_crops": [Tensor[B, C, H, W, D], ...],
             "global_masks": [BoolTensor[B, N], ...],
             "global_info": [{"spacing": ..., "modality": ...}, ...],
             "local_info": [{"spacing": ..., "modality": ...}, ...],
             "transforms_applied": optional,
         }
 
-    Subclasses implement the four objective methods and may override
-    ``update_objective_state`` for centers or other running statistics.
+    The objective methods can be overridden, but the default implementation
+    is complete and updates DINO/iBOT centers with distributed batch means.
     """
 
-    REQUIRED_OUTPUT_KEYS = {
+    GLOBAL_OUTPUT_KEYS = {
         "cls_features",
         "patch_features",
         "cls_projection",
         "patch_projection",
+        "patch_projection_indices",
+        "patch_grid_shape",
+    }
+
+    FEATURE_OUTPUT_KEYS = {
+        "cls_features",
+        "patch_features",
         "patch_grid_shape",
     }
 
@@ -274,6 +285,9 @@ class BrainDinoModule(BaseModule):
                 "visual_log_sample_index must be non-negative."
             )
 
+        if self.log_every_n_steps <= 0:
+            raise ValueError("log_every_n_steps must be positive.")
+
     def _total_optimizer_steps(self) -> int:
         """
         Return the configured number of optimizer updates.
@@ -301,11 +315,10 @@ class BrainDinoModule(BaseModule):
     def _ensure_centers(
         self,
         cls_projection: torch.Tensor,
-        patch_projection: torch.Tensor,
+        patch_projection: Optional[torch.Tensor] = None,
     ) -> None:
         """Initialize and validate the running teacher centers."""
         cls_dim = cls_projection.shape[-1]
-        patch_dim = patch_projection.shape[-1]
 
         if self.dino_center.numel() == 0:
             self.dino_center = torch.zeros(
@@ -321,6 +334,10 @@ class BrainDinoModule(BaseModule):
                 f"projection={tuple(cls_projection.shape)}."
             )
 
+        if patch_projection is None:
+            return
+
+        patch_dim = patch_projection.shape[-1]
         if self.ibot_center.numel() == 0:
             self.ibot_center = torch.zeros(
                 1,
@@ -369,10 +386,7 @@ class BrainDinoModule(BaseModule):
                 "At least one teacher global view is required."
             )
 
-        self._ensure_centers(
-            teacher_global[0]["cls_projection"],
-            teacher_global[0]["patch_projection"],
-        )
+        self._ensure_centers(teacher_global[0]["cls_projection"])
 
         with torch.no_grad():
             teacher_probabilities = [
@@ -427,8 +441,10 @@ class BrainDinoModule(BaseModule):
         """
         Masked patch-level iBOT self-distillation.
 
-        Only student patch positions marked ``True`` in ``global_masks`` are
-        optimized. The matching unmasked teacher patch provides the target.
+        The ViT projects only positions selected by ``global_masks``. Both
+        student and teacher therefore provide flat ``[M, K]`` logits plus
+        matching ``[M, 2]`` batch/token indices. This avoids materializing a
+        dense ``[B, 32^3, K]`` projection tensor.
         """
         if not (
             len(student_global)
@@ -459,22 +475,38 @@ class BrainDinoModule(BaseModule):
         ):
             student_projection = student_output["patch_projection"]
             teacher_projection = teacher_output["patch_projection"]
+            student_indices = student_output["patch_projection_indices"]
+            teacher_indices = teacher_output["patch_projection_indices"]
 
-            if mask.shape != student_projection.shape[:2]:
+            if student_projection is None or teacher_projection is None:
                 raise ValueError(
-                    "Each global mask must match the corresponding patch "
-                    "projection shape [B, N]. "
-                    f"mask={tuple(mask.shape)}, "
-                    f"projection={tuple(student_projection.shape)}."
+                    "Global views must return sparse patch projections."
                 )
-
-            if teacher_projection.shape[:2] != student_projection.shape[:2]:
+            if student_indices is None or teacher_indices is None:
                 raise ValueError(
-                    "Matching student and teacher global views must contain "
-                    "the same patch layout."
+                    "Sparse patch projections require projection indices."
                 )
-
-            if not mask.any():
+            expected_indices = mask.to(
+                device=student_indices.device,
+                dtype=torch.bool,
+            ).nonzero(as_tuple=False)
+            if not torch.equal(student_indices, expected_indices):
+                raise ValueError(
+                    "Student patch_projection_indices do not match the mask."
+                )
+            if not torch.equal(
+                teacher_indices.to(student_indices.device),
+                student_indices,
+            ):
+                raise ValueError(
+                    "Student and teacher sparse patch indices must match."
+                )
+            if teacher_projection.shape != student_projection.shape:
+                raise ValueError(
+                    "Matching sparse student and teacher projections must "
+                    "have equal shapes."
+                )
+            if student_projection.shape[0] == 0:
                 continue
 
             with torch.no_grad():
@@ -489,8 +521,8 @@ class BrainDinoModule(BaseModule):
 
             loss_terms.append(
                 self._teacher_cross_entropy(
-                    student_projection[mask],
-                    teacher_probability[mask],
+                    student_projection,
+                    teacher_probability,
                     self.student_temperature,
                 ).mean()
             )
@@ -566,6 +598,16 @@ class BrainDinoModule(BaseModule):
                 raise ValueError(
                     "Matching student and teacher views must have identical "
                     "patch_grid_shape values."
+                )
+
+            expected_mask_shape = (
+                student_output["patch_features"].shape[0],
+                math.prod(student_grid_shape),
+            )
+            if tuple(mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    "Each region mask must match [B, N]: expected "
+                    f"{expected_mask_shape}, got {tuple(mask.shape)}."
                 )
 
             student_features = self._patches_to_grid(
@@ -718,7 +760,7 @@ class BrainDinoModule(BaseModule):
     def _distributed_batch_center(
         self,
         projections: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute a globally synchronized mean projection."""
         flattened = projections.reshape(
             -1,
@@ -735,7 +777,10 @@ class BrainDinoModule(BaseModule):
             dist.all_reduce(projection_sum)
             dist.all_reduce(projection_count)
 
-        return projection_sum / projection_count.clamp_min(1.0)
+        return (
+            projection_sum / projection_count.clamp_min(1.0),
+            projection_count,
+        )
 
     @torch.no_grad()
     def update_objective_state(
@@ -746,12 +791,17 @@ class BrainDinoModule(BaseModule):
         if not teacher_global:
             return
 
+        patch_projections = [
+            output["patch_projection"]
+            for output in teacher_global
+            if output["patch_projection"] is not None
+        ]
         self._ensure_centers(
             teacher_global[0]["cls_projection"],
-            teacher_global[0]["patch_projection"],
+            patch_projections[0] if patch_projections else None,
         )
 
-        cls_batch_center = self._distributed_batch_center(
+        cls_batch_center, _ = self._distributed_batch_center(
             torch.cat(
                 [
                     output["cls_projection"]
@@ -760,24 +810,19 @@ class BrainDinoModule(BaseModule):
                 dim=0,
             )
         )
-        patch_batch_center = self._distributed_batch_center(
-            torch.cat(
-                [
-                    output["patch_projection"]
-                    for output in teacher_global
-                ],
-                dim=0,
-            )
-        )
-
         self.dino_center.mul_(self.center_momentum).add_(
             cls_batch_center,
             alpha=1.0 - self.center_momentum,
         )
-        self.ibot_center.mul_(self.center_momentum).add_(
-            patch_batch_center,
-            alpha=1.0 - self.center_momentum,
-        )
+        if patch_projections:
+            patch_batch_center, patch_count = self._distributed_batch_center(
+                torch.cat(patch_projections, dim=0)
+            )
+            if patch_count.item() > 0:
+                self.ibot_center.mul_(self.center_momentum).add_(
+                    patch_batch_center,
+                    alpha=1.0 - self.center_momentum,
+                )
 
     def _forward_model(
         self,
@@ -785,14 +830,25 @@ class BrainDinoModule(BaseModule):
         x: torch.Tensor,
         info: Optional[Mapping[str, Any]] = None,
         mask: Optional[torch.Tensor] = None,
+        patch_projection_mask: Optional[torch.Tensor] = None,
+        mode: str = "student",
+        return_backbone_features: bool = True,
     ) -> ModelOutput:
         info = dict(info or {})
+        spacing = info.get("spacing")
+        if spacing is None:
+            raise KeyError("Every view info dictionary must contain 'spacing'.")
         output = model(
             x,
-            spacing=info.get("spacing"),
+            spacing=spacing,
             modality=info.get("modality"),
             channel_mask=info.get("channel_mask"),
             mask=mask,
+            patch_projection_mask=patch_projection_mask,
+            valid_spatial_shapes=info.get("valid_spatial_shapes"),
+            mode=mode,
+            project_all_patches=False,
+            return_backbone_features=return_backbone_features,
         )
 
         if not isinstance(output, dict):
@@ -801,60 +857,78 @@ class BrainDinoModule(BaseModule):
                 f"{type(output).__name__}."
             )
 
-        missing = self.REQUIRED_OUTPUT_KEYS.difference(output.keys())
+        required = (
+            self.FEATURE_OUTPUT_KEYS
+            if mode == "features"
+            else {"cls_projection", "patch_projection", "patch_projection_indices", "patch_grid_shape"}
+        )
+        if return_backbone_features or mode == "features":
+            required = required.union(self.FEATURE_OUTPUT_KEYS)
+        missing = required.difference(output.keys())
         if missing:
             raise KeyError(
                 "The model output is missing required keys: "
                 f"{sorted(missing)}."
             )
 
-        self._validate_model_output(output)
+        self._validate_model_output(
+            output,
+            require_backbone_features=return_backbone_features or mode == "features",
+            expect_patch_projection=patch_projection_mask is not None,
+        )
         return output
 
     @staticmethod
-    def _validate_model_output(output: ModelOutput) -> None:
-        cls_features = output["cls_features"]
-        patch_features = output["patch_features"]
-        cls_projection = output["cls_projection"]
-        patch_projection = output["patch_projection"]
+    def _validate_model_output(
+        output: ModelOutput,
+        require_backbone_features: bool,
+        expect_patch_projection: bool,
+    ) -> None:
+        patch_features = output.get("patch_features")
+        cls_features = output.get("cls_features")
+        cls_projection = output.get("cls_projection")
+        patch_projection = output.get("patch_projection")
+        patch_indices = output.get("patch_projection_indices")
         patch_grid_shape = output["patch_grid_shape"]
 
-        for name, tensor in {
-            "cls_features": cls_features,
-            "patch_features": patch_features,
-            "cls_projection": cls_projection,
-            "patch_projection": patch_projection,
-        }.items():
+        tensors = {}
+        if require_backbone_features:
+            tensors.update(cls_features=cls_features, patch_features=patch_features)
+        if cls_projection is not None:
+            tensors["cls_projection"] = cls_projection
+        if patch_projection is not None:
+            tensors["patch_projection"] = patch_projection
+        for name, tensor in tensors.items():
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"{name} must be a torch.Tensor.")
 
-        if cls_features.ndim != 2:
+        if require_backbone_features and cls_features.ndim != 2:
             raise ValueError("cls_features must have shape [B, E].")
-        if patch_features.ndim != 3:
+        if require_backbone_features and patch_features.ndim != 3:
             raise ValueError("patch_features must have shape [B, N, E].")
-        if cls_projection.ndim != 2:
+        if cls_projection is not None and cls_projection.ndim != 2:
             raise ValueError("cls_projection must have shape [B, K_cls].")
-        if patch_projection.ndim != 3:
-            raise ValueError(
-                "patch_projection must have shape [B, N, K_patch]."
-            )
+        if expect_patch_projection:
+            if patch_projection is None or patch_indices is None:
+                raise ValueError("Expected sparse patch projections and indices.")
+            if patch_projection.ndim != 2:
+                raise ValueError("patch_projection must have shape [M, K_patch].")
+            if patch_indices.ndim != 2 or patch_indices.shape[1] != 2:
+                raise ValueError("patch_projection_indices must have shape [M, 2].")
+            if patch_projection.shape[0] != patch_indices.shape[0]:
+                raise ValueError("Sparse projection and index counts differ.")
+            if patch_indices.dtype != torch.long:
+                raise TypeError("patch_projection_indices must be torch.long.")
+        elif patch_projection is not None or patch_indices is not None:
+            raise ValueError("Unexpected patch projection for this view.")
 
-        batch_size = cls_features.shape[0]
-        for name, tensor in {
-            "patch_features": patch_features,
-            "cls_projection": cls_projection,
-            "patch_projection": patch_projection,
-        }.items():
-            if tensor.shape[0] != batch_size:
-                raise ValueError(
-                    f"{name} and cls_features must have equal batch sizes."
-                )
-
-        if patch_features.shape[1] != patch_projection.shape[1]:
-            raise ValueError(
-                "patch_features and patch_projection must contain the same "
-                "number of tokens."
-            )
+        batch_size = (
+            cls_features.shape[0]
+            if require_backbone_features
+            else cls_projection.shape[0]
+        )
+        if cls_projection is not None and cls_projection.shape[0] != batch_size:
+            raise ValueError("CLS feature and projection batch sizes differ.")
 
         if not isinstance(patch_grid_shape, (tuple, list)):
             raise TypeError(
@@ -870,8 +944,16 @@ class BrainDinoModule(BaseModule):
             )
 
         expected_tokens = math.prod(patch_grid_shape)
-        actual_tokens = patch_features.shape[1]
-        if expected_tokens != actual_tokens:
+        if patch_indices is not None and patch_indices.numel() > 0:
+            if (
+                (patch_indices[:, 0] < 0).any()
+                or (patch_indices[:, 0] >= batch_size).any()
+                or (patch_indices[:, 1] < 0).any()
+                or (patch_indices[:, 1] >= expected_tokens).any()
+            ):
+                raise ValueError("patch_projection_indices are out of range.")
+        actual_tokens = patch_features.shape[1] if patch_features is not None else expected_tokens
+        if require_backbone_features and expected_tokens != actual_tokens:
             raise ValueError(
                 "patch_grid_shape does not match token count: "
                 f"{tuple(patch_grid_shape)} -> {expected_tokens}, "
@@ -908,7 +990,7 @@ class BrainDinoModule(BaseModule):
         for index, crop in enumerate(global_crops):
             if crop.ndim != 5:
                 raise ValueError(
-                    f"global_crops[{index}] must have shape [B, C, D, H, W]."
+                    f"global_crops[{index}] must have shape [B, C, H, W, D]."
                 )
             if crop.shape[0] != batch_size:
                 raise ValueError(
@@ -918,7 +1000,7 @@ class BrainDinoModule(BaseModule):
         for index, crop in enumerate(local_crops):
             if crop.ndim != 5:
                 raise ValueError(
-                    f"local_crops[{index}] must have shape [B, C, D, H, W]."
+                    f"local_crops[{index}] must have shape [B, C, H, W, D]."
                 )
             if crop.shape[0] != batch_size:
                 raise ValueError(
@@ -973,12 +1055,53 @@ class BrainDinoModule(BaseModule):
             local_info=local_info,
         )
 
+        if len(teacher_global_crops) != len(global_crops):
+            raise ValueError(
+                "teacher_global_crops and global_crops must have equal lengths."
+            )
+        if len(teacher_global_info) != len(teacher_global_crops):
+            raise ValueError(
+                "teacher_global_info and teacher_global_crops must have equal lengths."
+            )
+        batch_size = global_crops[0].shape[0]
+        for index, crop in enumerate(teacher_global_crops):
+            if crop.ndim != 5 or crop.shape[0] != batch_size:
+                raise ValueError(
+                    f"teacher_global_crops[{index}] must be [B, C, H, W, D] "
+                    "with the global batch size."
+                )
+
+        # Run the no-gradient teacher before constructing any student autograd
+        # graphs. Otherwise the teacher's convolution/attention workspaces are
+        # allocated on top of every retained student-view activation, creating
+        # an avoidable peak that is especially large for full-volume batches.
+        with torch.no_grad():
+            teacher_global = [
+                self._forward_model(
+                    self.teacher,
+                    crop,
+                    info=info,
+                    mask=None,
+                    patch_projection_mask=mask,
+                    mode="teacher",
+                    return_backbone_features=True,
+                )
+                for crop, info, mask in zip(
+                    teacher_global_crops,
+                    teacher_global_info,
+                    global_masks,
+                )
+            ]
+
         student_global = [
             self._forward_model(
                 self.model,
                 crop,
                 info=info,
                 mask=mask,
+                patch_projection_mask=mask,
+                mode="student",
+                return_backbone_features=True,
             )
             for crop, info, mask in zip(
                 global_crops,
@@ -993,20 +1116,12 @@ class BrainDinoModule(BaseModule):
                 crop,
                 info=info,
                 mask=None,
+                patch_projection_mask=None,
+                mode="student",
+                return_backbone_features=False,
             )
             for crop, info in zip(local_crops, local_info)
         ]
-
-        with torch.no_grad():
-            teacher_global = [
-                self._forward_model(
-                    self.teacher,
-                    crop,
-                    info=info,
-                    mask=None,
-                )
-                for crop, info in zip(teacher_global_crops, teacher_global_info)
-            ]
 
         return student_global, student_local, teacher_global
 
@@ -1148,7 +1263,7 @@ class BrainDinoModule(BaseModule):
             student_global=student_global,
             student_local=student_local,
             teacher_global=teacher_global,
-            update_state=True,
+            update_state=False,
         )
         loss = losses["total"]
 
@@ -1162,6 +1277,9 @@ class BrainDinoModule(BaseModule):
                 },
             )
             return None
+
+        # Do not contaminate the running centers with a non-finite batch.
+        self.update_objective_state(teacher_global=teacher_global)
 
         batch_size = batch["global_crops"][0].shape[0]
 
@@ -1250,6 +1368,9 @@ class BrainDinoModule(BaseModule):
             batch["image"],
             info=batch.get("info", {}),
             mask=None,
+            patch_projection_mask=None,
+            mode="features",
+            return_backbone_features=True,
         )
         return {
             "cls_features": output["cls_features"],
@@ -1349,8 +1470,10 @@ class BrainDinoModule(BaseModule):
                     or name.endswith(".bias")
                     or "cls_token" in name
                     or "mask_token" in name
+                    or "global_token" in name
+                    or "global_position" in name
                     or "position" in name.lower()
-                    or "modality_token" in name
+                    or "modality_embed" in name
             )
 
             if use_no_decay:

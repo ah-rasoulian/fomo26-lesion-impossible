@@ -2,21 +2,22 @@ defaults:
   - core/braindino_vit@
 
 dimensions: 3D
-
 pretrain_net: pretrain_braindino_vit_b
 seg_net: task_vit_b_seg
 cls_net: task_vit_b_cls
 reg_net: task_vit_b_reg
-
-patch_kernel_size: 9
-patch_stride: 8
-patch_padding: 4
-
-init_sigma_mm: 4.0
-learn_sigma: true
-
-cls_projection_dim: 65536
-patch_projection_dim: 8192
-
 plugin_seg_net:
 plugin_seg_train_n_last_params:
+
+grid_size: [24, 24, 24]
+patch_kernel_size: 8
+window_size: [4, 4, 4]
+summary_grid_size: [8, 8, 8]
+
+init_sigma_mm: 8.0
+learn_sigma: true
+
+# Smaller than the previous 65,536/8,192 heads. These are still expressive,
+# while avoiding excessive compute in heads discarded after pretraining.
+cls_projection_dim: 16384
+patch_projection_dim: 2048

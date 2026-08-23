@@ -3,7 +3,7 @@ import os
 import pickle
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import nibabel as nib
 import numpy as np
@@ -65,7 +65,7 @@ class SubjectWisePretrainDataset(Dataset):
             group A is selected because T1 and T2 have higher priority.
     """
 
-    CACHE_VERSION = 1
+    CACHE_VERSION = 2
 
     def __init__(
         self,
@@ -158,7 +158,7 @@ class SubjectWisePretrainDataset(Dataset):
 
             if image.ndim != 4:
                 raise RuntimeError(
-                    f"Expected [C, D, H, W], but {file} produced "
+                    f"Expected [C, H, W, D], but {file} produced "
                     f"shape {tuple(image.shape)}."
                 )
 
@@ -189,8 +189,28 @@ class SubjectWisePretrainDataset(Dataset):
                 f"max_channels={self.max_channels}."
             )
 
-        info = get_file_info(selected_files[0])
+        info = dict(get_file_info(selected_files[0]))
+        if "spacing" not in info:
+            raise KeyError(f"get_file_info did not return spacing for {selected_files[0]}.")
+        # Preserve get_file_info's axis convention because it should match
+        # load_image_file; only normalize its representation and validate it.
+        spacing = torch.as_tensor(info["spacing"], dtype=torch.float32).flatten()
+        if spacing.numel() != 3:
+            raise ValueError(
+                f"Expected three spacing values, got {tuple(spacing.shape)}."
+            )
+        if not torch.isfinite(spacing).all() or (spacing <= 0).any():
+            raise ValueError(f"Invalid spacing for {selected_files[0]}: {spacing}.")
+        info["spacing"] = spacing
         info["modality"] = modality_ids
+        info["channel_mask"] = torch.ones(
+            len(selected_records),
+            dtype=torch.bool,
+        )
+        info["valid_spatial_shapes"] = torch.tensor(
+            data.shape[-3:],
+            dtype=torch.long,
+        )
 
         data_dict = {
             "session_path": selected_files,
@@ -202,28 +222,9 @@ class SubjectWisePretrainDataset(Dataset):
 
         data_dict = self._transform(data_dict)
 
-        if (
-            torch.isnan(data_dict["image"]).any()
-            or torch.isinf(data_dict["image"]).any()
-        ):
-            data_dict["image"] = torch.nan_to_num(
-                data_dict["image"],
-                nan=0.0,
-                posinf=4.0,
-                neginf=-1.0,
-            )
-
-        if data_dict.get("label") is not None:
-            if (
-                torch.isnan(data_dict["label"]).any()
-                or torch.isinf(data_dict["label"]).any()
-            ):
-                data_dict["label"] = torch.nan_to_num(
-                    data_dict["label"],
-                    nan=0.0,
-                    posinf=4.0,
-                    neginf=-1.0,
-                )
+        # Transforms may replace ``image`` with global/local crop lists, so
+        # sanitize the complete returned structure rather than only one key.
+        data_dict = self._sanitize_tensor_tree(data_dict)
 
         return data_dict
 
@@ -749,10 +750,6 @@ class SubjectWisePretrainDataset(Dataset):
         if image.ndim != 3:
             return None
 
-        # exclude 4D volumes.
-        if image.shape[-1] > 1200:
-            return None
-
         return {
             "file": file,
             "modality": modality,
@@ -884,3 +881,26 @@ class SubjectWisePretrainDataset(Dataset):
             data_dict = self.transforms(data_dict)
 
         return data_dict
+
+    @classmethod
+    def _sanitize_tensor_tree(cls, value: Any) -> Any:
+        """Replace non-finite floating values anywhere in a sample."""
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point() and not torch.isfinite(value).all():
+                return torch.nan_to_num(
+                    value,
+                    nan=0.0,
+                    posinf=4.0,
+                    neginf=-1.0,
+                )
+            return value
+        if isinstance(value, dict):
+            return {
+                key: cls._sanitize_tensor_tree(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._sanitize_tensor_tree(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._sanitize_tensor_tree(item) for item in value)
+        return value
