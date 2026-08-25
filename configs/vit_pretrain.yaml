@@ -11,6 +11,7 @@ model:
   # Compatibility with callbacks inherited from core/base. The current
   # launcher checkpoints by optimizer-step intervals.
   ckpt_every_n_epoch: 5
+#  freeze_backbone: True
 
 lightning:
   data_module: SubjectWisePretrainDataModule

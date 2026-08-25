@@ -9,15 +9,48 @@ reg_net: task_vit_b_reg
 plugin_seg_net:
 plugin_seg_train_n_last_params:
 
+# Backbone geometry. These values must exactly match pretraining.
 grid_size: [24, 24, 24]
 patch_kernel_size: 8
 window_size: [4, 4, 4]
 summary_grid_size: [8, 8, 8]
-
 init_sigma_mm: 8.0
 learn_sigma: true
 
-# Smaller than the previous 65,536/8,192 heads. These are still expressive,
-# while avoiding excessive compute in heads discarded after pretraining.
+# Pretraining-only projection heads.
 cls_projection_dim: 16384
 patch_projection_dim: 2048
+
+# Default downstream classification head.
+cls_hidden_dim: 128
+cls_dropout: 0.2
+cls_top_k_fraction: 0.05
+cls_min_top_k: 16
+cls_token_logit_weight: 1.0
+
+# Pretrained-backbone transfer and fine-tuning policy.
+freeze_backbone: true
+min_backbone_load_fraction: 0.95
+trainable_backbone_blocks: 0
+backbone_lr_multiplier: 0.01
+compile_mode:
+
+# Downstream optimizer defaults.
+finetune_optim: AdamW
+finetune_lr: 1.0e-3
+finetune_weight_decay: 1.0e-4
+momentum: 0.9
+nesterov: false
+warmup_ratio: 0.10
+cosine_period_ratio: 1.0
+minimum_lr: 1.0e-6
+ckpt_every_n_epoch: 5
+
+# Pretraining settings retained because this model config is shared.
+recovery_ckpt_every_n_optimizer_steps: 2000
+snapshot_ckpt_every_n_optimizer_steps: 10000
+pretrain_optim: AdamW
+pretrain_lr: 2.0e-4
+weight_decay: 0.04
+train_optim: SGD
+train_lr: 1.0e-2

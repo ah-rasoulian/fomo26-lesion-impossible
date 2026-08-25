@@ -1,16 +1,16 @@
 import lightning as pl
 import logging
 import torch.distributed as dist
-from asparagus.functional.collate import collate_return
 from asparagus.modules.datasets.TrainDataset import (
     ClsRegDataset,
     ClsRegTestDataset,
     SegDataset,
     SegTestDataset,
     SingleSubjectPredictDataset,
+    full_volume_task_collate,
 )
 from lightning.fabric.utilities.distributed import DistributedSamplerWrapper
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
 from torchvision.transforms import Compose
 from typing import Literal, Optional
 from collections import Counter
@@ -26,12 +26,15 @@ class SegDataModule(pl.LightningDataModule):
         num_workers: int,
         train_split: list,
         val_split: list,
-        test_samples: list = [],
-        predict_samples: Optional[list] = [],
+        test_samples: Optional[list] = None,
+        predict_samples: Optional[list] = None,
         predict_transforms: Optional[Compose] = None,
         train_transforms: Optional[Compose] = None,
         test_transforms: Optional[Compose] = None,
         val_transforms: Optional[Compose] = None,
+        pin_memory: bool = True,
+        persistent_workers: Optional[bool] = None,
+        prefetch_factor: int = 2,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -40,19 +43,33 @@ class SegDataModule(pl.LightningDataModule):
         self.val_transforms = val_transforms
         self.num_workers = num_workers
         self.train_split = train_split
-        self.test_samples = test_samples
+        self.test_samples = list(test_samples or [])
         self.val_split = val_split
-        self.predict_samples = predict_samples
+        self.predict_samples = list(predict_samples or [])
         self.predict_transforms = predict_transforms
+        self.pin_memory = bool(pin_memory)
+        self.persistent_workers = (
+            self.num_workers > 0
+            if persistent_workers is None
+            else bool(persistent_workers)
+        )
+        self.prefetch_factor = int(prefetch_factor)
+        if self.prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be positive.")
+        if self.num_workers == 0 and self.persistent_workers:
+            raise ValueError("persistent_workers requires num_workers > 0.")
 
         logging.info(f"Using {self.num_workers} workers")
 
-    def setup(self, stage: Literal["fit", "test", "predict"]):
-        if stage == "fit":
+    def setup(
+        self,
+        stage: Optional[Literal["fit", "validate", "test", "predict"]] = None,
+    ):
+        if stage in (None, "fit", "validate"):
             self.setup_fit()
-        elif stage == "test":
+        if stage in (None, "test"):
             self.setup_test()
-        elif stage == "predict":
+        if stage in (None, "predict"):
             self.setup_predict()
 
     def setup_fit(self):
@@ -83,44 +100,35 @@ class SegDataModule(pl.LightningDataModule):
         if dist.is_initialized():
             sampler = DistributedSamplerWrapper(sampler)
 
-        return DataLoader(
-            self.train_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=False,
-            persistent_workers=False,
-            drop_last=True,
-            sampler=sampler,
+        return self._loader(
+            self.train_dataset, batch_size=self.batch_size,
+            drop_last=True, sampler=sampler,
         )
 
     def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            num_workers=self.num_workers,
-            batch_size=self.batch_size,
-            pin_memory=True,
-            shuffle=False,
-            persistent_workers=False,
-            drop_last=False,
+        return self._loader(
+            self.val_dataset, batch_size=self.batch_size,
+            drop_last=False, shuffle=False,
         )
 
     def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            num_workers=self.num_workers,
-            batch_size=1,
-            pin_memory=False,
-            persistent_workers=False,
-            collate_fn=collate_return,
-        )
+        return self._loader(self.test_dataset, batch_size=1, shuffle=False)
 
     def predict_dataloader(self):
-        return DataLoader(
-            self.predict_dataset,
-            num_workers=self.num_workers,
-            batch_size=1,
-            collate_fn=collate_return,
-        )
+        return self._loader(self.predict_dataset, batch_size=1, shuffle=False)
+
+    def _loader(self, dataset, **kwargs):
+        loader_kwargs = {
+            "dataset": dataset,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "collate_fn": full_volume_task_collate,
+            **kwargs,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(**loader_kwargs)
 
 
 class ClsRegDataModule(pl.LightningDataModule):
@@ -137,7 +145,14 @@ class ClsRegDataModule(pl.LightningDataModule):
         test_samples: Optional[list] = None,
         predict_samples: Optional[list] = None,
         use_random_datasampler: bool = True,
+        use_weighted_sampler: bool = False,
+        weighted_sampler_power: float = 1.0,
+        train_num_samples: Optional[int] = None,
+        sampler_seed: int = 0,
         log_split_details: bool = True,
+        pin_memory: bool = True,
+        persistent_workers: Optional[bool] = None,
+        prefetch_factor: int = 2,
     ):
         super().__init__()
 
@@ -150,18 +165,44 @@ class ClsRegDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.test_samples = test_samples or []
         self.use_random_datasampler = use_random_datasampler
+        self.use_weighted_sampler = bool(use_weighted_sampler)
+        self.weighted_sampler_power = float(weighted_sampler_power)
+        self.train_num_samples = train_num_samples
+        self.sampler_seed = int(sampler_seed)
+        if self.use_random_datasampler and self.use_weighted_sampler:
+            raise ValueError(
+                "use_random_datasampler and use_weighted_sampler are mutually exclusive."
+            )
+        if not 0.0 < self.weighted_sampler_power <= 1.0:
+            raise ValueError("weighted_sampler_power must be in (0, 1].")
+        if self.train_num_samples is not None and self.train_num_samples < 1:
+            raise ValueError("train_num_samples must be positive when provided.")
         self.predict_samples = predict_samples or []
         self.predict_transforms = predict_transforms
         self.log_split_details = log_split_details
+        self.pin_memory = bool(pin_memory)
+        self.persistent_workers = (
+            self.num_workers > 0
+            if persistent_workers is None
+            else bool(persistent_workers)
+        )
+        self.prefetch_factor = int(prefetch_factor)
+        if self.prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be positive.")
+        if self.num_workers == 0 and self.persistent_workers:
+            raise ValueError("persistent_workers requires num_workers > 0.")
 
         logging.info("Using %d workers", self.num_workers)
 
-    def setup(self, stage: Literal["fit", "test", "predict"]):
-        if stage == "fit":
+    def setup(
+        self,
+        stage: Optional[Literal["fit", "validate", "test", "predict"]] = None,
+    ):
+        if stage in (None, "fit", "validate"):
             self.setup_fit()
-        elif stage == "test":
+        if stage in (None, "test"):
             self.setup_test()
-        elif stage == "predict":
+        if stage in (None, "predict"):
             self.setup_predict()
 
     def setup_fit(self):
@@ -391,11 +432,50 @@ class ClsRegDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         sampler = None
 
-        if self.use_random_datasampler:
+        number_of_samples = self.train_num_samples or len(self.train_dataset)
+        generator = torch.Generator().manual_seed(self.sampler_seed)
+
+        if self.use_weighted_sampler:
+            labels = []
+            for file in self.train_split:
+                label = self._read_clsreg_label(str(file))
+                if isinstance(label, tuple):
+                    raise ValueError(
+                        "Weighted sampling requires one scalar class label per sample."
+                    )
+                numeric_label = float(label)
+                class_index = int(numeric_label)
+                if numeric_label != class_index or class_index < 0:
+                    raise ValueError(
+                        f"Weighted sampling requires non-negative integer labels; "
+                        f"{file} contains {label}."
+                    )
+                labels.append(class_index)
+
+            counts = Counter(labels)
+            sample_weights = torch.tensor(
+                [counts[label] ** (-self.weighted_sampler_power) for label in labels],
+                dtype=torch.double,
+            )
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=number_of_samples,
+                replacement=True,
+                generator=generator,
+            )
+            logging.info(
+                "Using weighted replacement sampling: counts=%s, power=%.3f, "
+                "samples_per_epoch=%d",
+                dict(sorted(counts.items())),
+                self.weighted_sampler_power,
+                number_of_samples,
+            )
+        elif self.use_random_datasampler:
             sampler = RandomSampler(
                 self.train_dataset,
-                num_samples=999999,
+                num_samples=number_of_samples,
                 replacement=True,
+                generator=generator,
             )
 
             if dist.is_initialized():
@@ -405,15 +485,16 @@ class ClsRegDataModule(pl.LightningDataModule):
             "dataset": self.train_dataset,
             "num_workers": self.num_workers,
             "batch_size": self.batch_size,
-            "pin_memory": True,
-            "persistent_workers": self.num_workers > 0,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
             "drop_last": True,
             "shuffle": sampler is None,
             "sampler": sampler,
+            "collate_fn": full_volume_task_collate,
         }
 
         if self.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
 
         return DataLoader(**loader_kwargs)
 
@@ -422,14 +503,15 @@ class ClsRegDataModule(pl.LightningDataModule):
             "dataset": self.val_dataset,
             "num_workers": self.num_workers,
             "batch_size": self.batch_size,
-            "pin_memory": True,
-            "persistent_workers": self.num_workers > 0,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
             "drop_last": False,
             "shuffle": False,
+            "collate_fn": full_volume_task_collate,
         }
 
         if self.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
 
         return DataLoader(**loader_kwargs)
 
@@ -438,13 +520,13 @@ class ClsRegDataModule(pl.LightningDataModule):
             "dataset": self.test_dataset,
             "num_workers": self.num_workers,
             "batch_size": 1,
-            "pin_memory": True,
-            "persistent_workers": self.num_workers > 0,
-            "collate_fn": collate_return,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "collate_fn": full_volume_task_collate,
         }
 
         if self.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
 
         return DataLoader(**loader_kwargs)
 
@@ -453,13 +535,13 @@ class ClsRegDataModule(pl.LightningDataModule):
             "dataset": self.predict_dataset,
             "num_workers": self.num_workers,
             "batch_size": 1,
-            "pin_memory": True,
-            "persistent_workers": self.num_workers > 0,
-            "collate_fn": collate_return,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "collate_fn": full_volume_task_collate,
         }
 
         if self.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
 
         return DataLoader(**loader_kwargs)
 

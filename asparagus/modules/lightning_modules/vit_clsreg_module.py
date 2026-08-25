@@ -7,7 +7,6 @@ from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from asparagus.functional.metrics.utils import format_multilabel_metrics
 from asparagus.modules.lightning_modules.vit_task_base_module import (
     ViTTaskBaseModule,
@@ -328,147 +327,14 @@ class ViTClsRegModule(ViTTaskBaseModule):
         self.test_metrics.reset()
 
 
-class MulticlassFocalLoss(nn.Module):
-    """Numerically stable multiclass focal loss on raw logits.
-
-    ``weight`` is used as the per-class alpha factor. The losses are
-    averaged over samples without normalization by the sum of target-class
-    weights. Consequently, class weighting remains effective for batch
-    size one.
-
-    Setting ``gamma=0`` recovers mean-weighted cross-entropy.
-    """
-
-    def __init__(
-        self,
-        weight: Optional[Sequence[float]] = None,
-        gamma: float = 1.0,
-        label_smoothing: float = 0.0,
-    ) -> None:
-        super().__init__()
-
-        if not gamma >= 0.0:
-            raise ValueError(
-                "gamma must be non-negative."
-            )
-
-        if not 0.0 <= label_smoothing < 1.0:
-            raise ValueError(
-                "label_smoothing must be in [0, 1)."
-            )
-
-        if weight is None:
-            weight_tensor = None
-        else:
-            weight_tensor = torch.as_tensor(
-                weight,
-                dtype=torch.float32,
-            ).reshape(-1)
-
-            if not torch.isfinite(weight_tensor).all():
-                raise ValueError(
-                    "All class weights must be finite."
-                )
-
-            if (weight_tensor <= 0).any():
-                raise ValueError(
-                    "All class weights must be positive."
-                )
-
-        self.register_buffer(
-            "weight",
-            weight_tensor,
-            # Class weights may differ between cross-validation folds.
-            persistent=False,
-        )
-
-        self.gamma = float(gamma)
-        self.label_smoothing = float(label_smoothing)
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        if logits.ndim != 2:
-            raise ValueError(
-                "Expected logits with shape [B, C], got "
-                f"{tuple(logits.shape)}."
-            )
-
-        target = target.reshape(-1).long()
-
-        if target.shape[0] != logits.shape[0]:
-            raise ValueError(
-                f"Logits batch size is {logits.shape[0]}, but target "
-                f"batch size is {target.shape[0]}."
-            )
-
-        if target.numel() > 0:
-            minimum = int(target.min())
-            maximum = int(target.max())
-
-            if minimum < 0 or maximum >= logits.shape[1]:
-                raise ValueError(
-                    "Targets must be valid class indices in "
-                    f"[0, {logits.shape[1] - 1}], got range "
-                    f"[{minimum}, {maximum}]."
-                )
-
-        if (
-            self.weight is not None
-            and self.weight.numel() != logits.shape[1]
-        ):
-            raise ValueError(
-                "weight must contain one value per class: "
-                f"expected {logits.shape[1]}, "
-                f"got {self.weight.numel()}."
-            )
-
-        log_probabilities = F.log_softmax(
-            logits,
-            dim=-1,
-        )
-
-        target_log_probabilities = log_probabilities.gather(
-            dim=1,
-            index=target.unsqueeze(1),
-        ).squeeze(1)
-
-        target_probabilities = target_log_probabilities.exp()
-
-        sample_cross_entropy = F.cross_entropy(
-            logits,
-            target,
-            weight=None,
-            reduction="none",
-            label_smoothing=self.label_smoothing,
-        )
-
-        focal_factor = (
-            1.0 - target_probabilities
-        ).pow(self.gamma)
-
-        sample_losses = (
-            focal_factor * sample_cross_entropy
-        )
-
-        if self.weight is not None:
-            sample_weights = self.weight[target]
-            sample_losses = sample_losses * sample_weights
-
-        return sample_losses.mean()
-
-
 class ViTClassificationModule(ViTClsRegModule):
-    """Multiclass classification, including two-logit binary models."""
+    """Multiclass classification trained with ordinary cross-entropy."""
 
     def __init__(
         self,
         *args,
         label_smoothing: float = 0.0,
         loss_weight: Optional[Sequence[float]] = None,
-        focal_gamma: float = 1.0,
         positive_class_index: int = 1,
         **kwargs,
     ) -> None:
@@ -502,15 +368,16 @@ class ViTClassificationModule(ViTClsRegModule):
                     f"{loss_weight.numel()}."
                 )
 
-        self.loss = MulticlassFocalLoss(
+        self.loss = nn.CrossEntropyLoss(
             weight=loss_weight,
-            gamma=focal_gamma,
             label_smoothing=label_smoothing,
         )
 
-        # Monitor natural validation NLL. Class weighting and focal
-        # modulation are optimization choices rather than evaluation metrics.
-        self.validation_loss = nn.CrossEntropyLoss()
+        # Training and validation use the same proper scoring rule. Dataset
+        # imbalance is handled by sampling rather than by modifying the loss.
+        self.validation_loss = nn.CrossEntropyLoss(
+            label_smoothing=label_smoothing,
+        )
 
         self.task_type = "classification"
         self._initialize_metrics()

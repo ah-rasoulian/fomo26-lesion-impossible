@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import nibabel as nib
 import numpy as np
@@ -22,13 +22,19 @@ def get_processed_data_info(file: str) -> dict:
     properties_file = file.replace(".pt", ".pkl")
     properties = load_pickle(properties_file)
 
+    unknown_id = int(MODALITY_TO_ID.get("UNKNOWN", 0))
     modality_ids = torch.tensor(
-        [MODALITY_TO_ID[modality] for modality in properties["modalities"]],dtype=torch.long,
+        [MODALITY_TO_ID.get(modality, unknown_id) for modality in properties["modalities"]],
+        dtype=torch.long,
     )
+
+    spacing = torch.as_tensor(properties["new_spacing"], dtype=torch.float32)
+    if spacing.shape != (3,) or not torch.isfinite(spacing).all() or (spacing <= 0).any():
+        raise RuntimeError(f"Invalid [H, W, D] spacing in metadata for {file}: {spacing}.")
 
     return {
         "affine": torch.as_tensor(properties["nifti_metadata"]["affine"], dtype=torch.float32),
-        "spacing": torch.as_tensor(properties["new_spacing"], dtype=torch.float32),
+        "spacing": spacing,
         "direction": properties["new_direction"],
         "modality": modality_ids,
     }
@@ -101,6 +107,33 @@ def _validate_modality_count(
             f"{modality.numel()} entries."
         )
 
+    info["channel_mask"] = torch.ones(image.shape[0], dtype=torch.bool)
+    info.setdefault(
+        "valid_spatial_shapes",
+        torch.tensor(image.shape[1:], dtype=torch.long),
+    )
+
+
+def _finalize_sample_metadata(data_dict: dict, file: str) -> dict:
+    """Finalize metadata after transforms without treating padding as anatomy."""
+    image = _ensure_image_shape(data_dict["image"], file)
+    data_dict["image"] = image
+    info = data_dict.setdefault("info", {})
+
+    current_shape = torch.tensor(image.shape[1:], dtype=torch.long)
+    previous_shape = info.get("valid_spatial_shapes")
+    if previous_shape is None:
+        valid_shape = current_shape
+    else:
+        previous_shape = torch.as_tensor(previous_shape, dtype=torch.long).reshape(3)
+        valid_shape = torch.minimum(previous_shape, current_shape)
+    if (valid_shape <= 0).any():
+        raise RuntimeError(f"Invalid spatial shape for {file}: {valid_shape.tolist()}.")
+    info["valid_spatial_shapes"] = valid_shape
+
+    _validate_modality_count(data_dict, file)
+    return data_dict
+
 
 def _sanitize_tensor(
     tensor: torch.Tensor,
@@ -128,6 +161,7 @@ def _sanitize_data_dict(
     tensor_keys = (
         "image",
         "label",
+        "SEG_label",
         "CLSREG_label",
         "src_label",
     )
@@ -165,7 +199,13 @@ class BaseTaskDataset(Dataset):
         if self.transforms is not None:
             data_dict = self.transforms(data_dict)
 
-        return _sanitize_data_dict(data_dict)
+        data_dict = _sanitize_data_dict(data_dict)
+        data_dict = _finalize_sample_metadata(
+            data_dict, str(data_dict.get("file_path", "sample"))
+        )
+        if "label" in data_dict:
+            data_dict["SEG_label"] = data_dict["label"]
+        return data_dict
 
 
 class SegDataset(BaseTaskDataset):
@@ -219,6 +259,10 @@ class SegDataset(BaseTaskDataset):
         _validate_modality_count(data_dict, file)
 
         data_dict = self._transform(data_dict)
+
+        # The task module accepts both names. Keep `label` for existing spatial
+        # transforms and expose the explicit task key only after augmentation.
+        data_dict["SEG_label"] = data_dict["label"]
 
         # foreground_locations is only required by transforms such as
         # foreground-aware cropping.
@@ -487,8 +531,7 @@ class SingleSubjectPredictDataset(BaseTaskDataset):
         if file.endswith((".nii", ".nii.gz")):
             nifti = nib.load(file)
 
-            # nibabel returns [D, H, W] according to the current
-            # project convention.
+            # Nibabel axes are retained as the project's [H, W, D] order.
             image = torch.from_numpy(
                 np.asarray(nifti.dataobj, dtype=np.float32)
             ).unsqueeze(0)
@@ -590,3 +633,100 @@ class SingleSubjectPredictDataset(BaseTaskDataset):
             raise RuntimeError(
                 f"Affine mismatch for {file}."
             )
+
+
+def full_volume_task_collate(samples: Sequence[Mapping[str, Any]]) -> dict:
+    """Pad variable-size, variable-channel full volumes for one task batch.
+
+    Images are padded only on the high end of each axis. The original valid
+    shapes and real-channel mask are retained so the physical convolution and
+    segmentation loss can ignore padding.
+    """
+    if not samples:
+        raise ValueError("Cannot collate an empty batch.")
+
+    images = [torch.as_tensor(sample["image"]).float() for sample in samples]
+    if any(image.ndim != 4 for image in images):
+        raise ValueError("Every image must have shape [C, H, W, D].")
+
+    batch_size = len(images)
+    max_channels = max(image.shape[0] for image in images)
+    max_shape = tuple(max(image.shape[axis] for image in images) for axis in range(1, 4))
+    image_batch = images[0].new_zeros((batch_size, max_channels, *max_shape))
+    modality = torch.zeros((batch_size, max_channels), dtype=torch.long)
+    channel_mask = torch.zeros((batch_size, max_channels), dtype=torch.bool)
+    spacing = torch.empty((batch_size, 3), dtype=torch.float32)
+    valid_shapes = torch.empty((batch_size, 3), dtype=torch.long)
+
+    for index, (sample, image) in enumerate(zip(samples, images)):
+        channels, height, width, depth = image.shape
+        image_batch[index, :channels, :height, :width, :depth] = image
+        info = sample.get("info", {})
+
+        sample_modality = torch.as_tensor(
+            info.get("modality", torch.zeros(channels)), dtype=torch.long
+        ).reshape(-1)
+        if sample_modality.numel() != channels:
+            raise ValueError(
+                f"Sample {index} has {channels} channels but "
+                f"{sample_modality.numel()} modality IDs."
+            )
+        modality[index, :channels] = sample_modality
+        channel_mask[index, :channels] = True
+
+        sample_spacing = torch.as_tensor(info["spacing"], dtype=torch.float32).reshape(-1)
+        if sample_spacing.shape != (3,) or (sample_spacing <= 0).any():
+            raise ValueError(f"Sample {index} has invalid spacing {sample_spacing}.")
+        spacing[index] = sample_spacing
+
+        sample_valid_shape = torch.as_tensor(
+            info.get("valid_spatial_shapes", image.shape[1:]), dtype=torch.long
+        ).reshape(-1)
+        if sample_valid_shape.shape != (3,):
+            raise ValueError("Each valid_spatial_shapes value must contain 3 entries.")
+        actual_shape = torch.tensor(image.shape[1:], dtype=torch.long)
+        valid_shapes[index] = torch.minimum(sample_valid_shape, actual_shape)
+
+    batch: dict[str, Any] = {
+        "image": image_batch,
+        "file_path": [sample.get("file_path") for sample in samples],
+        "info": {
+            "spacing": spacing,
+            "modality": modality,
+            "channel_mask": channel_mask,
+            "valid_spatial_shapes": valid_shapes,
+            "affine": [sample.get("info", {}).get("affine") for sample in samples],
+            "direction": [sample.get("info", {}).get("direction") for sample in samples],
+        },
+    }
+
+    if all("CLSREG_label" in sample for sample in samples):
+        labels = [torch.as_tensor(sample["CLSREG_label"]) for sample in samples]
+        try:
+            batch["CLSREG_label"] = torch.stack(labels)
+        except RuntimeError as error:
+            raise ValueError("CLSREG labels in a batch must have matching shapes.") from error
+
+    segmentation_key = None
+    if all("SEG_label" in sample for sample in samples):
+        segmentation_key = "SEG_label"
+    elif all("label" in sample for sample in samples):
+        segmentation_key = "label"
+    if segmentation_key is not None:
+        labels = [_ensure_label_shape(sample[segmentation_key], str(index)) for index, sample in enumerate(samples)]
+        max_label_channels = max(label.shape[0] for label in labels)
+        label_batch = labels[0].new_zeros(
+            (batch_size, max_label_channels, *max_shape)
+        )
+        for index, label in enumerate(labels):
+            channels, height, width, depth = label.shape
+            label_batch[index, :channels, :height, :width, :depth] = label
+        batch["label"] = label_batch
+        batch["SEG_label"] = label_batch
+
+    # Keep non-tensor restoration metadata as per-sample lists.
+    for key in ("id", "properties", "src_label", "transforms_applied"):
+        if any(key in sample for sample in samples):
+            batch[key] = [sample.get(key) for sample in samples]
+
+    return batch

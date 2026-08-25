@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /subjectwise_pretrain
+  - /vit_pretrain
   - /model/braindino_vit_b@model
   - /hardware/1node4gpus@hardware
   - _self_

@@ -17,6 +17,7 @@ _seg_net:
   summary_grid_size: ${model.summary_grid_size}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  freeze_backbone: ${model.freeze_backbone}
 
 _cls_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.cls_net}
@@ -26,6 +27,12 @@ _cls_net:
   summary_grid_size: ${model.summary_grid_size}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  hidden_dim: ${model.cls_hidden_dim}
+  dropout: ${model.cls_dropout}
+  top_k_fraction: ${model.cls_top_k_fraction}
+  min_top_k: ${model.cls_min_top_k}
+  token_logit_weight: ${model.cls_token_logit_weight}
+  freeze_backbone: ${model.freeze_backbone}
 
 _reg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.reg_net}
@@ -35,26 +42,8 @@ _reg_net:
   summary_grid_size: ${model.summary_grid_size}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  freeze_backbone: ${model.freeze_backbone}
 
 _plugin_seg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.plugin_seg_net}
   dimensions: ${model.dimensions}
-
-recovery_ckpt_every_n_optimizer_steps: 2000
-snapshot_ckpt_every_n_optimizer_steps: 10000
-
-pretrain_optim: AdamW
-pretrain_lr: 2.0e-4
-weight_decay: 0.04
-warmup_ratio: 0.05
-cosine_period_ratio: 1.0
-minimum_lr: 1.0e-6
-ckpt_every_n_epoch: 5
-
-train_optim: SGD
-train_lr: 1e-2
-nesterov: True
-momentum: 0.99
-
-finetune_optim: AdamW
-finetune_lr: 1e-4

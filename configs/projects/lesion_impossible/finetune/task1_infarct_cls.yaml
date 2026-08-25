@@ -1,0 +1,63 @@
+# @package _global_
+defaults:
+  - /vit_finetune
+  - /model/braindino_vit_b@model
+  - _self_
+
+task: CLS002_FOMO26_Infarct
+root: lesion_impossible
+stem: finetune
+
+checkpoint_run_id:
+
+model:
+  net: ${model.cls_net}
+  freeze_backbone: true
+  trainable_backbone_blocks: 0
+  min_backbone_load_fraction: 0.95
+
+  # Must match pretraining exactly.
+  grid_size: [24, 24, 24]
+  patch_kernel_size: 8
+  window_size: [4, 4, 4]
+  summary_grid_size: [8, 8, 8]
+
+  # Small-lesion classification head.
+  cls_hidden_dim: 128
+  cls_dropout: 0.2
+  cls_top_k_fraction: 0.01
+  cls_min_top_k: 16
+  cls_token_logit_weight: 1.0
+
+  # Only the new head is optimized while the backbone is frozen.
+  finetune_optim: AdamW
+  finetune_lr: 1.0e-3
+  finetune_weight_decay: 1.0e-4
+  warmup_ratio: 0.10
+  cosine_period_ratio: 1.0
+  minimum_lr: 1.0e-6
+
+lightning:
+  data_module: ClsRegDataModule
+  lightning_module: ViTClassificationModule
+
+training:
+  batch_size: 4
+  accumulate_grad_batches: 4
+  steps_per_epoch: 25
+  samples_per_epoch: 100
+  use_weighted_sampler: true
+  weighted_sampler_power: 0.5
+  label_smoothing: 0.0
+
+transforms:
+  center_crop_fraction: 0.9
+  flip_probability: 0.5
+  rotation_degrees: 8.0
+  scale_range: [0.95, 1.05]
+  affine_probability: 0.3
+  noise_probability: 0.15
+  bias_field_probability: 0.15
+  gamma_probability: 0.2
+  blur_probability: 0.05
+  elastic_probability: 0.0

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import ceil
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,8 +32,10 @@ class ViTTaskFeatures:
     feature_maps: Tuple[torch.Tensor, ...]
     # Final-layer spatial map: [B, E, Gd, Gh, Gw].
     final_feature_map: torch.Tensor
-    # Original full-volume spatial shape.
+    # Padded input tensor spatial shape, in the network's [H, W, D] order.
     input_shape: Tuple[int, int, int]
+    # Per-subject unpadded shapes, when supplied by the collate function.
+    valid_spatial_shapes: Optional[torch.Tensor]
 
 
 class ViTTaskModel(nn.Module):
@@ -79,10 +82,11 @@ class ViTTaskModel(nn.Module):
         spacing: torch.Tensor,
         modality: Optional[torch.Tensor] = None,
         channel_mask: Optional[torch.Tensor] = None,
+        valid_spatial_shapes: Optional[torch.Tensor] = None,
     ) -> ViTTaskFeatures:
         if x.ndim != 5:
             raise ValueError(
-                f"x must be [B, C, D, H, W], got {tuple(x.shape)}."
+                f"x must be [B, C, H, W, D], got {tuple(x.shape)}."
             )
 
         batch_size = x.shape[0]
@@ -97,6 +101,18 @@ class ViTTaskModel(nn.Module):
 
         if channel_mask is not None and channel_mask.ndim == 1:
             channel_mask = channel_mask.unsqueeze(0)
+
+        if valid_spatial_shapes is not None:
+            valid_spatial_shapes = torch.as_tensor(
+                valid_spatial_shapes, device=x.device, dtype=torch.long
+            )
+            if valid_spatial_shapes.ndim == 1:
+                valid_spatial_shapes = valid_spatial_shapes.unsqueeze(0)
+            if valid_spatial_shapes.shape != (batch_size, 3):
+                raise ValueError(
+                    "valid_spatial_shapes must be [B, 3], got "
+                    f"{tuple(valid_spatial_shapes.shape)}."
+                )
 
         if spacing.shape[0] != batch_size:
             raise ValueError(
@@ -123,6 +139,9 @@ class ViTTaskModel(nn.Module):
                     spacing,
                     modality,
                     channel_mask,
+                    valid_spatial_shapes=valid_spatial_shapes,
+                    return_feature_map=True,
+                    return_intermediate=True,
                 )
         else:
             features = self.backbone.forward_features(
@@ -130,7 +149,13 @@ class ViTTaskModel(nn.Module):
                 spacing,
                 modality,
                 channel_mask,
+                valid_spatial_shapes=valid_spatial_shapes,
+                return_feature_map=True,
+                return_intermediate=True,
             )
+
+        if features.feature_map is None:
+            raise RuntimeError("Backbone did not return its final feature map.")
 
         levels = tuple(features.intermediate_feature_maps)
         final_index = len(self.backbone.blocks) - 1
@@ -144,6 +169,7 @@ class ViTTaskModel(nn.Module):
             feature_maps=levels,
             final_feature_map=features.feature_map,
             input_shape=tuple(int(v) for v in x.shape[2:]),
+            valid_spatial_shapes=valid_spatial_shapes,
         )
 
 
@@ -278,8 +304,13 @@ class ViTSegModel(ViTTaskModel):
             dropout=decoder_dropout,
         )
 
-    def forward(self, x, spacing, modality=None, channel_mask=None):
-        features = self.forward_feature(x, spacing, modality, channel_mask)
+    def forward(
+        self, x, spacing, modality=None, channel_mask=None,
+        valid_spatial_shapes=None,
+    ):
+        features = self.forward_feature(
+            x, spacing, modality, channel_mask, valid_spatial_shapes
+        )
         return self.decoder(features.feature_maps, features.input_shape)
 
 
@@ -422,12 +453,22 @@ class ViTClsModel(ViTTaskModel):
             token_logit_weight=token_logit_weight,
         )
 
-    def forward(self, x, spacing, modality=None, channel_mask=None):
-        features = self.forward_feature(x, spacing, modality, channel_mask)
+    def forward(
+        self, x, spacing, modality=None, channel_mask=None,
+        valid_spatial_shapes=None,
+    ):
+        features = self.forward_feature(
+            x, spacing, modality, channel_mask, valid_spatial_shapes
+        )
         return self.classifier(features.cls, features.final_feature_map)
 
-    def predict_proba(self, x, spacing, modality=None, channel_mask=None):
-        return self.forward(x, spacing, modality, channel_mask).softmax(dim=-1)
+    def predict_proba(
+        self, x, spacing, modality=None, channel_mask=None,
+        valid_spatial_shapes=None,
+    ):
+        return self.forward(
+            x, spacing, modality, channel_mask, valid_spatial_shapes
+        ).softmax(dim=-1)
 
 
 class ViTRegModel(ViTTaskModel):
@@ -452,27 +493,95 @@ class ViTRegModel(ViTTaskModel):
             cls_weight=cls_weight,
         )
 
-    def forward(self, x, spacing, modality=None, channel_mask=None):
-        features = self.forward_feature(x, spacing, modality, channel_mask)
+    def forward(
+        self, x, spacing, modality=None, channel_mask=None,
+        valid_spatial_shapes=None,
+    ):
+        features = self.forward_feature(
+            x, spacing, modality, channel_mask, valid_spatial_shapes
+        )
         return self.regressor(features.cls, features.final_feature_map)
 
 
+def load_braindino_student_backbone(
+    model: ViTTaskModel,
+    checkpoint: Union[str, Path, Mapping[str, Any]],
+    *,
+    min_loaded_fraction: float = 0.90,
+) -> nn.modules.module._IncompatibleKeys:
+    """Load only the pretrained student backbone into a downstream model.
+
+    Lightning and ``torch.compile`` wrapper prefixes are tolerated. Teacher,
+    DINO/iBOT heads, centers, and all downstream task-head parameters are
+    deliberately ignored.
+    """
+    if not 0.0 < min_loaded_fraction <= 1.0:
+        raise ValueError("min_loaded_fraction must be in (0, 1].")
+
+    payload: Any = checkpoint
+    if isinstance(checkpoint, (str, Path)):
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise TypeError("checkpoint must be a path or a mapping.")
+
+    state: Mapping[str, Any] = payload
+    for container_key in ("state_dict", "model_state_dict"):
+        candidate = state.get(container_key)
+        if isinstance(candidate, Mapping):
+            state = candidate
+            break
+
+    backbone_state = {}
+    markers = ("student.backbone.", "student_backbone.", "backbone.")
+    target_keys = set(model.backbone.state_dict())
+    for raw_key, value in state.items():
+        if not isinstance(raw_key, str) or not torch.is_tensor(value):
+            continue
+        key = raw_key.replace("_orig_mod.", "")
+        mapped = None
+        # Prefer an explicit student path; never fall back from a teacher key.
+        if "teacher" in key.split("."):
+            continue
+        for marker in markers:
+            position = key.find(marker)
+            if position >= 0:
+                mapped = key[position + len(marker):]
+                break
+        if mapped is None and key in target_keys:
+            mapped = key
+        if mapped in target_keys:
+            backbone_state[mapped] = value
+
+    loaded_fraction = len(backbone_state) / max(len(target_keys), 1)
+    if loaded_fraction < min_loaded_fraction:
+        raise RuntimeError(
+            "Too few student-backbone tensors matched: "
+            f"{len(backbone_state)}/{len(target_keys)} "
+            f"({loaded_fraction:.1%}); required {min_loaded_fraction:.1%}. "
+            "Check that the task architecture matches the pretraining config."
+        )
+    return model.backbone.load_state_dict(backbone_state, strict=False)
+
+
 def _task_vit_b_backbone(
-    patch_kernel_size: int,
-    patch_stride: int,
-    patch_padding: int,
-    init_sigma_mm: float,
-    learn_sigma: bool,
+    grid_size: Union[int, Sequence[int]] = (24, 24, 24),
+    patch_kernel_size: Union[int, Sequence[int]] = 8,
+    window_size: Union[int, Sequence[int]] = (4, 4, 4),
+    summary_grid_size: Union[int, Sequence[int]] = (8, 8, 8),
+    init_sigma_mm: float = 8.0,
+    learn_sigma: bool = True,
 ) -> SpacingAwareViT3d:
     """Create the ViT-B backbone used during BrainDINO pretraining."""
     return SpacingAwareViT3d(
         embed_dim=768,
         depth=12,
         num_heads=12,
+        grid_size=grid_size,
         mlp_ratio=4.0,
         patch_kernel_size=patch_kernel_size,
-        patch_stride=patch_stride,
-        patch_padding=patch_padding,
+        window_size=window_size,
+        summary_grid_size=summary_grid_size,
+        num_register_tokens=8,
         init_sigma_mm=init_sigma_mm,
         learn_sigma=learn_sigma,
         position_num_bands=16,
@@ -483,20 +592,22 @@ def _task_vit_b_backbone(
 
 
 def task_vit_b_seg(
-    patch_kernel_size: int,
-    patch_stride: int,
-    patch_padding: int,
-    init_sigma_mm: float,
-    learn_sigma: bool,
+    grid_size=(24, 24, 24),
+    patch_kernel_size=8,
+    window_size=(4, 4, 4),
+    summary_grid_size=(8, 8, 8),
+    init_sigma_mm: float = 8.0,
+    learn_sigma: bool = True,
     output_channels: int = 1,
     decoder_hidden_dim: int = 128,
     decoder_dropout: float = 0.2,
     freeze_backbone: bool = True,
 ) -> ViTSegModel:
     backbone = _task_vit_b_backbone(
+        grid_size,
         patch_kernel_size,
-        patch_stride,
-        patch_padding,
+        window_size,
+        summary_grid_size,
         init_sigma_mm,
         learn_sigma,
     )
@@ -510,11 +621,12 @@ def task_vit_b_seg(
 
 
 def task_vit_b_cls(
-    patch_kernel_size: int,
-    patch_stride: int,
-    patch_padding: int,
-    init_sigma_mm: float,
-    learn_sigma: bool,
+    grid_size=(24, 24, 24),
+    patch_kernel_size=8,
+    window_size=(4, 4, 4),
+    summary_grid_size=(8, 8, 8),
+    init_sigma_mm: float = 8.0,
+    learn_sigma: bool = True,
     num_classes: int = 2,
     hidden_dim: int = 128,
     dropout: float = 0.2,
@@ -524,9 +636,10 @@ def task_vit_b_cls(
     freeze_backbone: bool = True,
 ) -> ViTClsModel:
     backbone = _task_vit_b_backbone(
+        grid_size,
         patch_kernel_size,
-        patch_stride,
-        patch_padding,
+        window_size,
+        summary_grid_size,
         init_sigma_mm,
         learn_sigma,
     )
@@ -543,11 +656,12 @@ def task_vit_b_cls(
 
 
 def task_vit_b_reg(
-    patch_kernel_size: int,
-    patch_stride: int,
-    patch_padding: int,
-    init_sigma_mm: float,
-    learn_sigma: bool,
+    grid_size=(24, 24, 24),
+    patch_kernel_size=8,
+    window_size=(4, 4, 4),
+    summary_grid_size=(8, 8, 8),
+    init_sigma_mm: float = 8.0,
+    learn_sigma: bool = True,
     output_dim: int = 1,
     hidden_dim: int = 128,
     dropout: float = 0.2,
@@ -555,9 +669,10 @@ def task_vit_b_reg(
     freeze_backbone: bool = True,
 ) -> ViTRegModel:
     backbone = _task_vit_b_backbone(
+        grid_size,
         patch_kernel_size,
-        patch_stride,
-        patch_padding,
+        window_size,
+        summary_grid_size,
         init_sigma_mm,
         learn_sigma,
     )
