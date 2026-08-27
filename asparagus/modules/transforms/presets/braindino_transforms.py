@@ -808,14 +808,16 @@ class BrainDinoViewTransform:
             self._augment_padded_view(image, normalized_info)
             for _ in range(self.n_global_crops)
         ]
-        teacher_global_crops = [
-            self._apply_channel_mask(view, info["channel_mask"])
-            for view, info in zip(paired_global_views, teacher_global_info)
-        ]
-        global_crops = [
-            self._apply_channel_mask(view, info["channel_mask"])
-            for view, info in zip(paired_global_views, student_global_info)
-        ]
+
+        # Student and teacher share the image storage. Their modality and channel
+        # corruption remain different through their respective metadata.
+        teacher_global_crops = list(
+            paired_global_views
+        )
+
+        global_crops = list(
+            paired_global_views
+        )
 
         local_crops = []
         local_info = []
@@ -826,18 +828,29 @@ class BrainDinoViewTransform:
             )
             base_info = _clone_metadata(normalized_info)
             base_info["valid_spatial_shapes"] = local_shapes
-            student_info = self._augment_student_info(base_info)
-            local_view = self._augment_padded_view(local_base, base_info)
-            local_crops.append(
-                self._apply_channel_mask(local_view, student_info["channel_mask"])
+
+            student_info = (self._augment_student_info(base_info))
+
+            local_view = (
+                self._augment_padded_view(local_base, base_info)
             )
+
+            local_crops.append(local_view)
             local_info.append(student_info)
 
         global_masks = [
-            self._make_mask(image.shape[0], image.device, view_index)
-            for view_index in range(self.n_global_crops)
+            self._make_mask(
+                image.shape[0],
+                image.device,
+                view_index,
+            )
+            for view_index in range(
+                self.n_global_crops
+            )
         ]
+
         result = dict(batch)
+
         result.update(
             {
                 "global_crops": global_crops,

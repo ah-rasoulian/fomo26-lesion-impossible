@@ -1,7 +1,7 @@
 # @package _global_
 defaults:
   - /vit_pretrain
-  - /model/braindino_vit_b@model
+  - /model/braindino_vit_s@model
   - /hardware/1node4gpus@hardware
   - _self_
 
@@ -9,5 +9,10 @@ task: PT902_FOMO300K_HF
 root: lesion_impossible
 stem: pretrain
 
-# Empty means pretrain from scratch.
+# Used to reconnect the source run’s logging information.
 checkpoint_run_id: null
+
+training:
+  # This is what actually restores the student, teacher, centers,
+  # optimizer, scheduler and global step.
+  resume_ckpt: null

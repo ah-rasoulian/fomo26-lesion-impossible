@@ -116,7 +116,7 @@ class BrainDinoModule(BaseModule):
             dino_loss_weight: float = 1.0,
             ibot_loss_weight: float = 1.0,
             region_loss_weight: float = 1.0,
-            koleo_loss_weight: float = 0.1,
+            koleo_loss_weight: float = 0.05,
             teacher_momentum: float = 0.994,
             teacher_momentum_final: float = 1.0,
             teacher_temperature: float = 0.07,
@@ -126,7 +126,8 @@ class BrainDinoModule(BaseModule):
             region_pool_size: Tuple[int, int, int] = (2, 2, 2),
             region_max_masked_fraction: float = 0.5,
             koleo_eps: float = 1e-8,
-
+            koleo_distance_floor: float = 0.05,
+            loss_ema_decay: float = 0.98,
             visual_log_every_n_steps: int = 1000,
             visual_log_max_channels: int = 3,
             visual_log_sample_index: int = 0,
@@ -175,6 +176,11 @@ class BrainDinoModule(BaseModule):
             region_max_masked_fraction
         )
         self.koleo_eps = float(koleo_eps)
+        self.koleo_distance_floor = float(koleo_distance_floor)
+        self.loss_ema_decay = float(loss_ema_decay)
+
+        # Diagnostic only; deliberately excluded from checkpoint state.
+        self._loss_ema: Optional[torch.Tensor] = None
 
         self.visual_log_every_n_steps = int(visual_log_every_n_steps)
         self.visual_log_max_channels = int(visual_log_max_channels)
@@ -249,6 +255,14 @@ class BrainDinoModule(BaseModule):
             )
         if self.koleo_eps <= 0.0:
             raise ValueError("koleo_eps must be positive.")
+
+        if not 0.0 < self.koleo_distance_floor < 2.0:
+            raise ValueError(
+                "koleo_distance_floor must be strictly between 0 and 2."
+            )
+
+        if not 0.0 <= self.loss_ema_decay < 1.0:
+            raise ValueError("loss_ema_decay must be in [0, 1).")
 
         if not 0.0 < self.warmup_ratio < 1.0:
             raise ValueError(
@@ -613,11 +627,11 @@ class BrainDinoModule(BaseModule):
             student_features = self._patches_to_grid(
                 student_output["patch_features"],
                 student_grid_shape,
-            ).float()
+            )
             teacher_features = self._patches_to_grid(
                 teacher_output["patch_features"].detach(),
                 teacher_grid_shape,
-            ).float()
+            )
 
             depth, height, width = student_grid_shape
             kernel = (
@@ -630,12 +644,12 @@ class BrainDinoModule(BaseModule):
                 student_features,
                 kernel_size=kernel,
                 stride=kernel,
-            )
+            ).float()
             teacher_regions = F.avg_pool3d(
                 teacher_features,
                 kernel_size=kernel,
                 stride=kernel,
-            )
+            ).float()
 
             mask_grid = (
                 mask.reshape(mask.shape[0], 1, depth, height, width)
@@ -692,12 +706,12 @@ class BrainDinoModule(BaseModule):
             student_global: Sequence[ModelOutput],
     ) -> torch.Tensor:
         """
-        Compute KoLeo regularization independently for each global view.
+        Compute KoLeo independently for each global view.
 
-        Keeping views separate prevents different augmentations of the same
-        subject from becoming nearest neighbors.
+        Candidate neighbours are gathered across all DDP ranks. Only the local
+        query features remain differentiable; DDP averages their gradients.
         """
-        if len(student_global) == 0:
+        if not student_global:
             raise ValueError(
                 "student_global must contain at least one global view."
             )
@@ -713,10 +727,6 @@ class BrainDinoModule(BaseModule):
                     f"{tuple(features.shape)}."
                 )
 
-            if features.shape[0] < 2:
-                continue
-
-            # Compute KoLeo in float32 for numerical stability under AMP.
             normalized = F.normalize(
                 features.float(),
                 p=2,
@@ -724,35 +734,111 @@ class BrainDinoModule(BaseModule):
                 eps=self.koleo_eps,
             )
 
+            local_size = normalized.shape[0]
+
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+                rank = dist.get_rank()
+
+                size_tensor = torch.tensor(
+                    [local_size],
+                    device=normalized.device,
+                    dtype=torch.long,
+                )
+
+                gathered_sizes = [
+                    torch.zeros_like(size_tensor)
+                    for _ in range(world_size)
+                ]
+
+                dist.all_gather(gathered_sizes, size_tensor)
+
+                sizes = [
+                    int(value.item())
+                    for value in gathered_sizes
+                ]
+
+                maximum_size = max(sizes)
+
+                padded = F.pad(
+                    normalized.detach(),
+                    (0, 0, 0, maximum_size - local_size),
+                )
+
+                gathered = [
+                    torch.empty_like(padded)
+                    for _ in range(world_size)
+                ]
+
+                dist.all_gather(gathered, padded)
+
+                candidate_parts = [
+                    tensor[:size]
+                    for tensor, size in zip(gathered, sizes)
+                ]
+
+                # Retain key-side gradients for features on this rank.
+                candidate_parts[rank] = normalized
+
+                candidates = torch.cat(
+                    candidate_parts,
+                    dim=0,
+                )
+
+                self_indices = (
+                        sum(sizes[:rank])
+                        + torch.arange(
+                    local_size,
+                    device=normalized.device,
+                )
+                )
+
+            else:
+                candidates = normalized
+
+                self_indices = torch.arange(
+                    local_size,
+                    device=normalized.device,
+                )
+
+            if candidates.shape[0] < 2:
+                continue
+
             distances = torch.cdist(
                 normalized,
-                normalized,
+                candidates,
                 p=2,
             )
 
-            diagonal_mask = torch.eye(
-                distances.shape[0],
-                device=distances.device,
-                dtype=torch.bool,
+            row_indices = torch.arange(
+                local_size,
+                device=normalized.device,
             )
 
-            # Must be out of place: CdistBackward needs its original output.
-            distances = distances.masked_fill(
-                diagonal_mask,
-                float("inf"),
-            )
+            # Do not modify torch.cdist's original output in place.
+            distances = distances.clone()
+            distances[row_indices, self_indices] = float("inf")
 
-            nearest_neighbor_distance = distances.min(dim=1).values
+            nearest_neighbor_distance = distances.min(
+                dim=1
+            ).values
 
             view_loss = -torch.log(
-                nearest_neighbor_distance.clamp_min(self.koleo_eps)
+                nearest_neighbor_distance.clamp_min(
+                    max(
+                        self.koleo_eps,
+                        self.koleo_distance_floor,
+                    )
+                )
             ).mean()
 
             loss_terms.append(view_loss)
 
         if not loss_terms:
-            # Differentiable zero on the correct device.
-            return student_global[0]["cls_features"].sum() * 0.0
+            return (
+                    student_global[0]["cls_features"].sum()
+                    * 0.0
+            )
 
         return torch.stack(loss_terms).mean()
 
@@ -1206,15 +1292,15 @@ class BrainDinoModule(BaseModule):
             teacher_global=teacher_global,
             global_masks=global_masks,
         )
-        koleo_loss = self.compute_koleo_loss(
-            student_global=student_global,
-        )
+        # koleo_loss = self.compute_koleo_loss(
+        #     student_global=student_global,
+        # )
 
         scalar_losses = {
             "dino": dino_loss,
             "ibot": ibot_loss,
             "region": region_loss,
-            "koleo": koleo_loss,
+            # "koleo": koleo_loss,
         }
         for name, loss in scalar_losses.items():
             if not isinstance(loss, torch.Tensor):
@@ -1228,7 +1314,7 @@ class BrainDinoModule(BaseModule):
             self.dino_loss_weight * dino_loss
             + self.ibot_loss_weight * ibot_loss
             + self.region_loss_weight * region_loss
-            + self.koleo_loss_weight * koleo_loss
+            # + self.koleo_loss_weight * koleo_loss
         )
 
         if update_state:
@@ -1240,7 +1326,8 @@ class BrainDinoModule(BaseModule):
             "dino": dino_loss,
             "ibot": ibot_loss,
             "region": region_loss,
-            "koleo": koleo_loss,
+            # "koleo": koleo_loss,
+            "koleo": 0,
             "teacher_temperature": total_loss.new_tensor(
                 teacher_temperature
             ),
@@ -1267,9 +1354,22 @@ class BrainDinoModule(BaseModule):
         )
         loss = losses["total"]
 
-        if not torch.isfinite(loss):
+        # Every rank must make the same decision, otherwise one rank can skip
+        # backward while the others remain blocked in DDP reduction.
+        finite_flag = torch.isfinite(
+            loss.detach()
+        ).to(dtype=torch.int32)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(
+                finite_flag,
+                op=dist.ReduceOp.MIN,
+            )
+
+        if not bool(finite_flag.item()):
             logging.error(
-                "Non-finite BrainDINO loss at batch %s: %s",
+                "Non-finite BrainDINO loss on at least one rank "
+                "at batch %s: %s",
                 batch_idx,
                 {
                     name: float(value.detach())
@@ -1278,14 +1378,29 @@ class BrainDinoModule(BaseModule):
             )
             return None
 
-        # Do not contaminate the running centers with a non-finite batch.
-        self.update_objective_state(teacher_global=teacher_global)
+        self.update_objective_state(
+            teacher_global=teacher_global
+        )
 
         batch_size = batch["global_crops"][0].shape[0]
+
+        with torch.no_grad():
+            current_loss = loss.detach().float()
+
+            if self._loss_ema is None:
+                self._loss_ema = current_loss.clone()
+            else:
+                self._loss_ema.mul_(
+                    self.loss_ema_decay
+                ).add_(
+                    current_loss,
+                    alpha=1.0 - self.loss_ema_decay,
+                )
 
         self.log_dict(
             {
                 "train/loss/total": losses["total"],
+                "train/loss/total_ema": self._loss_ema,
                 "train/loss/dino": losses["dino"],
                 "train/loss/ibot": losses["ibot"],
                 "train/loss/region": losses["region"],
@@ -1431,16 +1546,9 @@ class BrainDinoModule(BaseModule):
         return metrics
 
     def on_after_backward(self) -> None:
-        grad_clip_val = getattr(
-            self.trainer,
-            "gradient_clip_val",
-            None,
-        )
+        # This hook still records AMP/performance information, but gradient norm
+        # is recorded only when the accumulated optimizer gradient is clipped.
         metric_groups = {
-            "stability": stability_metrics.compute_on_backward(
-                self.model,
-                grad_clip_val,
-            ),
             "performance": perf_metrics.compute_on_backward(self.trainer),
         }
 
@@ -1452,6 +1560,64 @@ class BrainDinoModule(BaseModule):
                 stage="train",
                 metric_groups=metric_groups,
             ),
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+    def configure_gradient_clipping(
+            self,
+            optimizer,
+            gradient_clip_val: Optional[float] = None,
+            gradient_clip_algorithm: Optional[str] = None,
+    ) -> None:
+        """
+        Clip once per optimizer update after gradient accumulation and AMP
+        unscaling. clip_grad_norm_ returns the pre-clipping norm.
+        """
+        del gradient_clip_algorithm
+
+        parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+
+        clip_value = float(gradient_clip_val or 0.0)
+
+        if clip_value <= 0.0:
+            raise ValueError(
+                "BrainDINO requires positive norm clipping."
+            )
+
+        if parameters:
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                parameters,
+                max_norm=clip_value,
+                norm_type=2.0,
+                error_if_nonfinite=True,
+                foreach=None,
+            ).float()
+        else:
+            gradient_norm = torch.zeros((), device=self.device)
+
+        if not torch.isfinite(gradient_norm):
+            raise FloatingPointError(
+                "The accumulated optimizer gradient norm is "
+                "non-finite. The recovery checkpoint was "
+                "left unchanged."
+            )
+
+        clipping_event = (gradient_norm > clip_value).to(torch.float32)
+
+        datamodule = getattr(self.trainer, "datamodule", None)
+        batch_size = getattr(datamodule, "batch_size", None)
+
+        self.log_dict(
+            {
+                "train/stability/gradient_norm": gradient_norm,
+                "train/stability/gradient_clipping_events": clipping_event,
+            },
             sync_dist=True,
             batch_size=batch_size,
         )
@@ -1572,34 +1738,34 @@ class BrainDinoModule(BaseModule):
             panel_size: tuple[int, int] = (192, 192),
     ) -> torch.Tensor:
         """
-        Convert [D, H, W] into an RGB montage containing central
-        axial, coronal, and sagittal slices.
+        Convert a valid, unpadded [H, W, D] input into an RGB montage containing
+        central D-, W-, and H-axis slices.
         """
         if volume.ndim != 3:
             raise ValueError(
-                f"Expected [D, H, W], got {tuple(volume.shape)}."
+                f"Expected [H, W, D], got {tuple(volume.shape)}."
             )
 
-        depth, height, width = volume.shape
+        height, width, depth = volume.shape
 
         slices = [
-            volume[depth // 2, :, :],
-            volume[:, height // 2, :],
-            volume[:, :, width // 2],
+            volume[:, :, depth // 2],
+            volume[:, width // 2, :],
+            volume[height // 2, :, :],
         ]
 
         if mask_volume is None:
             mask_slices = [None, None, None]
         else:
             mask_slices = [
-                mask_volume[depth // 2, :, :],
-                mask_volume[:, height // 2, :],
-                mask_volume[:, :, width // 2],
+                mask_volume[:, :, depth // 2],
+                mask_volume[:, width // 2, :],
+                mask_volume[height // 2, :, :],
             ]
 
         panels = []
 
-        for image_slice, mask_slice in zip(slices, mask_slices, ):
+        for image_slice, mask_slice in zip(slices, mask_slices):
             normalized = cls._normalize_slice(image_slice)
 
             normalized = F.interpolate(
@@ -1624,7 +1790,13 @@ class BrainDinoModule(BaseModule):
 
             panels.append(rgb.cpu())
 
-        return make_grid(panels, nrow=3, padding=4, normalize=False, pad_value=1.0)
+        return make_grid(
+            panels,
+            nrow=3,
+            padding=4,
+            normalize=False,
+            pad_value=1.0,
+        )
 
     @staticmethod
     def _mask_to_volume(
@@ -1659,21 +1831,18 @@ class BrainDinoModule(BaseModule):
             mask_volume: torch.Tensor,
             panel_size: tuple[int, int] = (192, 192),
     ) -> torch.Tensor:
-        """
-        Create an RGB montage of the central axial, coronal, and
-        sagittal slices of a binary voxel mask.
-        """
         if mask_volume.ndim != 3:
             raise ValueError(
-                f"Expected [D, H, W], got {tuple(mask_volume.shape)}."
+                f"Expected [H, W, D], got "
+                f"{tuple(mask_volume.shape)}."
             )
 
-        depth, height, width = mask_volume.shape
+        height, width, depth = mask_volume.shape
 
         mask_slices = [
-            mask_volume[depth // 2, :, :],
-            mask_volume[:, height // 2, :],
-            mask_volume[:, :, width // 2],
+            mask_volume[:, :, depth // 2],
+            mask_volume[:, width // 2, :],
+            mask_volume[height // 2, :, :],
         ]
 
         panels = []
@@ -1685,7 +1854,12 @@ class BrainDinoModule(BaseModule):
                 mode="nearest",
             )[0, 0]
 
-            rgb = resized.unsqueeze(0).repeat(3, 1, 1)
+            rgb = resized.unsqueeze(0).repeat(
+                3,
+                1,
+                1,
+            )
+
             panels.append(rgb.cpu())
 
         return make_grid(
@@ -1694,6 +1868,178 @@ class BrainDinoModule(BaseModule):
             padding=4,
             normalize=False,
             pad_value=1.0,
+        )
+
+    @staticmethod
+    def _extract_effective_view_sample(
+            crop: torch.Tensor,
+            info: Mapping[str, Any],
+            sample_index: int,
+    ) -> Tuple[
+        torch.Tensor,
+        List[int],
+        List[int],
+        Tuple[int, int, int],
+    ]:
+        """
+        Remove batch padding and channels ignored by the network.
+
+        Returns:
+            sample:
+                [C_valid, H_valid, W_valid, D_valid]
+            original_channel_indices:
+                Channel positions in the collated tensor.
+            modality_ids:
+                Modality ID corresponding to each displayed channel.
+            valid_shape:
+                The unpadded spatial shape.
+        """
+        if crop.ndim != 5:
+            raise ValueError(
+                "Expected crop [B, C, H, W, D], "
+                f"got {tuple(crop.shape)}."
+            )
+
+        if not 0 <= sample_index < crop.shape[0]:
+            raise IndexError(
+                "visual sample_index is outside the batch."
+            )
+
+        padded_shape = tuple(
+            int(value)
+            for value in crop.shape[-3:]
+        )
+
+        valid_shapes = info.get(
+            "valid_spatial_shapes"
+        )
+
+        if valid_shapes is None:
+            valid_shape = padded_shape
+        else:
+            valid_shape_tensor = torch.as_tensor(
+                valid_shapes,
+                device=crop.device,
+                dtype=torch.long,
+            )
+
+            if valid_shape_tensor.shape != (
+                    crop.shape[0],
+                    3,
+            ):
+                raise ValueError(
+                    "valid_spatial_shapes must have "
+                    "shape [B, 3]."
+                )
+
+            valid_shape = tuple(
+                int(value)
+                for value in valid_shape_tensor[
+                    sample_index
+                ].tolist()
+            )
+
+            if any(
+                    size < 1 or size > padded
+                    for size, padded in zip(
+                        valid_shape,
+                        padded_shape,
+                    )
+            ):
+                raise ValueError(
+                    f"Invalid visual valid shape "
+                    f"{valid_shape} for padded shape "
+                    f"{padded_shape}."
+                )
+
+        channel_mask_value = info.get(
+            "channel_mask"
+        )
+
+        if channel_mask_value is None:
+            channel_mask = torch.ones(
+                crop.shape[:2],
+                device=crop.device,
+                dtype=torch.bool,
+            )
+        else:
+            channel_mask = torch.as_tensor(
+                channel_mask_value,
+                device=crop.device,
+                dtype=torch.bool,
+            )
+
+        if channel_mask.shape != crop.shape[:2]:
+            raise ValueError(
+                "channel_mask must have shape [B, C]."
+            )
+
+        active_channels = torch.where(
+            channel_mask[sample_index]
+        )[0]
+
+        if active_channels.numel() == 0:
+            raise ValueError(
+                "The visualized sample has no active channels."
+            )
+
+        modality_value = info.get("modality")
+
+        if modality_value is None:
+            modality = torch.full(
+                crop.shape[:2],
+                -1,
+                device=crop.device,
+                dtype=torch.long,
+            )
+        else:
+            modality = torch.as_tensor(
+                modality_value,
+                device=crop.device,
+                dtype=torch.long,
+            )
+
+        if modality.shape != crop.shape[:2]:
+            raise ValueError(
+                "modality must have shape [B, C]."
+            )
+
+        height, width, depth = valid_shape
+
+        sample = crop[
+            sample_index,
+            :,
+            :height,
+            :width,
+            :depth,
+        ].detach().index_select(
+            0,
+            active_channels,
+        )
+
+        original_channel_indices = (
+            active_channels
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        modality_ids = (
+            modality[sample_index]
+            .index_select(
+                0,
+                active_channels,
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        return (
+            sample,
+            original_channel_indices,
+            modality_ids,
+            valid_shape,
         )
 
     @classmethod
@@ -1748,23 +2094,48 @@ class BrainDinoModule(BaseModule):
 
         step = int(self.global_step)
 
-        # Avoid duplicate logs across gradient-accumulation microbatches.
         if step == self._last_visual_log_step:
             return
 
         if step % self.visual_log_every_n_steps != 0:
             return
 
-        wandb_logger = self.get_logger_by_class_name("WandbLogger")
+        wandb_logger = self.get_logger_by_class_name(
+            "WandbLogger"
+        )
+
         if wandb_logger is None:
             return
 
         self._define_wandb_visual_metrics()
 
         global_crops = batch["global_crops"]
-        teacher_global_crops = batch["teacher_global_crops"]
-        local_crops = batch.get("local_crops", [])
+
+        teacher_global_crops = batch[
+            "teacher_global_crops"
+        ]
+
+        local_crops = batch.get(
+            "local_crops",
+            [],
+        )
+
         global_masks = batch["global_masks"]
+
+        global_info = batch.get(
+            "global_info",
+            [{} for _ in global_crops],
+        )
+
+        teacher_global_info = batch.get(
+            "teacher_global_info",
+            [{} for _ in teacher_global_crops],
+        )
+
+        local_info = batch.get(
+            "local_info",
+            [{} for _ in local_crops],
+        )
 
         sample_index = self.visual_log_sample_index
         batch_size = global_crops[0].shape[0]
@@ -1779,52 +2150,107 @@ class BrainDinoModule(BaseModule):
         def add_crop(
                 destination: list,
                 crop: torch.Tensor,
+                info: Mapping[str, Any],
                 view_name: str,
         ) -> None:
-            sample = crop[sample_index].detach()
-            number_channels = min(sample.shape[0], self.visual_log_max_channels)
+            (
+                sample,
+                channel_indices,
+                modality_ids,
+                valid_shape,
+            ) = self._extract_effective_view_sample(
+                crop=crop,
+                info=info,
+                sample_index=sample_index,
+            )
 
-            for channel_index in range(number_channels):
-                montage = self._volume_montage(volume=sample[channel_index])
+            number_channels = min(
+                sample.shape[0],
+                self.visual_log_max_channels,
+            )
+
+            for local_channel_index in range(
+                    number_channels
+            ):
+                montage = self._volume_montage(
+                    volume=sample[
+                        local_channel_index
+                    ]
+                )
 
                 destination.append(
                     wandb.Image(
                         montage,
                         caption=(
                             f"view={view_name} | "
-                            f"channel={channel_index} | "
+                            f"channel="
+                            f"{channel_indices[local_channel_index]} | "
+                            f"modality="
+                            f"{modality_ids[local_channel_index]} | "
+                            f"valid_shape={valid_shape} | "
                             f"sample={sample_index} | "
                             f"optimizer_step={step}"
                         ),
                     )
                 )
 
-        # Teacher global crops are useful for checking teacher preprocessing.
-        for view_index, crop in enumerate(teacher_global_crops):
+        for view_index, (crop, info) in enumerate(
+                zip(
+                    teacher_global_crops,
+                    teacher_global_info,
+                )
+        ):
             add_crop(
                 destination=teacher_images,
                 crop=crop,
-                view_name=f"teacher_global_{view_index}",
+                info=info,
+                view_name=(
+                    f"teacher_global_{view_index}"
+                ),
             )
 
-        # Combine original, mask overlay, and binary mask in one image.
-        for view_index, crop in enumerate(global_crops):
-            sample = crop[sample_index].detach()
+        for view_index, (crop, info) in enumerate(
+                zip(
+                    global_crops,
+                    global_info,
+                )
+        ):
+            (
+                sample,
+                channel_indices,
+                modality_ids,
+                valid_shape,
+            ) = self._extract_effective_view_sample(
+                crop=crop,
+                info=info,
+                sample_index=sample_index,
+            )
 
             mask_volume = self._mask_to_volume(
-                mask=global_masks[view_index][sample_index],
+                mask=global_masks[
+                    view_index
+                ][sample_index],
                 patch_grid_shape=student_global[
                     view_index
                 ]["patch_grid_shape"],
-                spatial_shape=crop.shape[-3:],
+                spatial_shape=valid_shape,
             )
 
-            number_channels = min(sample.shape[0], self.visual_log_max_channels)
+            number_channels = min(
+                sample.shape[0],
+                self.visual_log_max_channels,
+            )
 
-            for channel_index in range(number_channels):
-                comparison = self._global_mask_comparison(
-                    volume=sample[channel_index],
-                    mask_volume=mask_volume,
+            for local_channel_index in range(
+                    number_channels
+            ):
+                comparison = (
+                    self._global_mask_comparison(
+                        volume=sample[
+                            local_channel_index
+                        ],
+                        mask_volume=mask_volume,
+                    )
                 )
 
                 global_comparison_images.append(
@@ -1832,34 +2258,57 @@ class BrainDinoModule(BaseModule):
                         comparison,
                         caption=(
                             f"global_view={view_index} | "
-                            f"channel={channel_index} | "
+                            f"channel="
+                            f"{channel_indices[local_channel_index]} | "
+                            f"modality="
+                            f"{modality_ids[local_channel_index]} | "
+                            f"valid_shape={valid_shape} | "
                             f"sample={sample_index} | "
                             f"optimizer_step={step} | "
-                            "rows=original, mask_overlay, binary_mask"
+                            "rows=original, "
+                            "mask_overlay, binary_mask"
                         ),
                     )
                 )
 
-        # Local crops do not have iBOT masks.
-        for view_index, crop in enumerate(local_crops):
+        for view_index, (crop, info) in enumerate(
+                zip(
+                    local_crops,
+                    local_info,
+                )
+        ):
             add_crop(
                 destination=local_images,
                 crop=crop,
-                view_name=f"student_local_{view_index}",
+                info=info,
+                view_name=(
+                    f"student_local_{view_index}"
+                ),
             )
 
-        visual_data = {"visuals/global_step": step}
+        visual_data = {
+            "visuals/global_step": step
+        }
 
         if global_comparison_images:
-            visual_data["visuals/global_mask_comparison"] = global_comparison_images
+            visual_data[
+                "visuals/global_mask_comparison"
+            ] = global_comparison_images
 
         if teacher_images:
-            visual_data["visuals/teacher_global"] = teacher_images
+            visual_data[
+                "visuals/teacher_global"
+            ] = teacher_images
 
         if local_images:
-            visual_data["visuals/student_local"] = local_images
+            visual_data[
+                "visuals/student_local"
+            ] = local_images
 
-        wandb_logger.experiment.log(visual_data, commit=True,)
+        wandb_logger.experiment.log(
+            visual_data,
+            commit=True,
+        )
 
         self._last_visual_log_step = step
 

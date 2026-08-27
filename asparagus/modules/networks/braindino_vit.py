@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from asparagus.modules.networks.blocks.layers.physical_conv3d import Int3, PhysicalGaussianMaskedConv3d, expand_spacing, to_3tuple
 from asparagus.functional.loading import MODALITY_TO_ID
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 
 PretrainingMode = Literal["student", "teacher", "features"]
@@ -540,6 +541,7 @@ class SpacingAwareViT3d(nn.Module):
         position_num_bands: int = 16,
         intermediate_layers: Optional[Sequence[int]] = None,
         modality_to_id: Optional[Mapping[str, int]] = None,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -583,10 +585,10 @@ class SpacingAwareViT3d(nn.Module):
         self.modality_embed = nn.Embedding(
             self.num_modalities + 1,
             embed_dim,
-            padding_idx=self.unknown_modality_id,
+            padding_idx=self.padding_modality_id,
         )
         with torch.no_grad():
-            self.modality_embed.weight[self.unknown_modality_id].zero_()
+            self.modality_embed.weight[self.padding_modality_id].zero_()
 
         self.position_dropout = nn.Dropout(dropout)
         half_window = tuple(value // 2 for value in window_size)
@@ -621,6 +623,7 @@ class SpacingAwareViT3d(nn.Module):
                 f"intermediate_layers must be in [0, {depth - 1}], got {layers}."
             )
         self.intermediate_layers = layers
+        self.gradient_checkpointing = gradient_checkpointing
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
@@ -759,17 +762,26 @@ class SpacingAwareViT3d(nn.Module):
 
         intermediate: List[torch.Tensor] = []
         for index, block in enumerate(self.blocks):
-            patches, global_tokens = block(
-                patches,
-                global_tokens,
-                embedded.grid_shape,
-            )
+            if (
+                    self.gradient_checkpointing
+                    and self.training
+                    and torch.is_grad_enabled()
+            ):
+                def run_block(
+                        patch_tokens: torch.Tensor, global_token_values: torch.Tensor, module: nn.Module = block
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                    return module(patch_tokens, global_token_values, embedded.grid_shape)
+
+                patches, global_tokens = (
+                    activation_checkpoint(run_block, patches, global_tokens, use_reentrant=False)
+                )
+
+            else:
+                patches, global_tokens = block(patches, global_tokens, embedded.grid_shape)
+
             if return_intermediate and index in self.intermediate_layers:
                 intermediate.append(
-                    self.tokens_to_map(
-                        self.patch_norm(patches),
-                        embedded.grid_shape,
-                    )
+                    self.tokens_to_map(self.patch_norm(patches), embedded.grid_shape)
                 )
 
         patches = self.patch_norm(patches)
@@ -984,6 +996,7 @@ def pretrain_braindino_vit_s(
     learn_sigma: bool = True,
     cls_projection_dim: int = 8192,
     patch_projection_dim: int = 1024,
+    gradient_checkpointing: bool = False,
 ) -> BrainDinoViT:
     backbone = SpacingAwareViT3d(
         embed_dim=384,
@@ -1001,6 +1014,7 @@ def pretrain_braindino_vit_s(
         learn_sigma=learn_sigma,
         position_num_bands=16,
         intermediate_layers=(2, 5, 8, 11),
+        gradient_checkpointing=gradient_checkpointing,
     )
     return BrainDinoViT(
         backbone=backbone,
@@ -1021,6 +1035,7 @@ def pretrain_braindino_vit_b(
     learn_sigma: bool = True,
     cls_projection_dim: int = 16384,
     patch_projection_dim: int = 2048,
+    gradient_checkpointing: bool = False,
 ) -> BrainDinoViT:
     backbone = SpacingAwareViT3d(
         embed_dim=768,
@@ -1038,6 +1053,7 @@ def pretrain_braindino_vit_b(
         learn_sigma=learn_sigma,
         position_num_bands=16,
         intermediate_layers=(2, 5, 8, 11),
+        gradient_checkpointing=gradient_checkpointing
     )
     return BrainDinoViT(
         backbone=backbone,

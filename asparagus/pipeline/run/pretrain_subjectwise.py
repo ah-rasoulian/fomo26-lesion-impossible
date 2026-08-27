@@ -5,6 +5,8 @@ import math
 import operator
 import random
 from typing import Any
+import os
+from pathlib import Path
 
 import hydra
 import lightning as pl
@@ -74,6 +76,44 @@ _SAFE_FUNCTIONS = {
     "round": round,
 }
 
+
+def _resolve_resume_checkpoint(
+    cfg: DictConfig,
+) -> str | None:
+    configured = cfg.training.get(
+        "resume_ckpt"
+    )
+
+    if configured is None or str(configured).strip().lower() in ("", "null", "none"):
+        if cfg.get("checkpoint_run_id") not in (None, ""):
+            raise ValueError(
+                "checkpoint_run_id reconnects "
+                "run metadata but does not load "
+                "training state. Also set "
+                "training.resume_ckpt."
+            )
+        return None
+
+    configured = os.path.expandvars(str(configured))
+
+    if configured == "last":
+        return configured
+
+    checkpoint = Path(configured).expanduser()
+
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            "training.resume_ckpt does not "
+            f"exist: {checkpoint}"
+        )
+
+    if checkpoint.suffix != ".ckpt":
+        raise ValueError(
+            "training.resume_ckpt must point "
+            f"to a .ckpt file: {checkpoint}"
+        )
+
+    return str(checkpoint.resolve())
 
 def _evaluate_arithmetic_node(node: ast.AST) -> Any:
     if isinstance(node, ast.Expression):
@@ -223,6 +263,7 @@ def _validate_configuration(cfg: DictConfig) -> None:
 )
 def main(cfg: DictConfig) -> None:
     _validate_configuration(cfg)
+    resume_ckpt = _resolve_resume_checkpoint(cfg)
 
     if HydraConfig.get().runtime.output_dir:
         print(f"Version: {cfg.run_id}")
@@ -361,6 +402,10 @@ def main(cfg: DictConfig) -> None:
         unknown_modality_id=cfg.transforms.unknown_modality_id,
         train_metadata_cache_path=cfg.data.train_metadata_cache_path,
         val_metadata_cache_path=cfg.data.val_metadata_cache_path,
+        num_workers=cfg.hardware.num_workers,
+        persistent_workers=cfg.hardware.persistent_workers,
+        prefetch_factor=cfg.hardware.prefetch_factor,
+        pin_memory=cfg.hardware.pin_memory,
     )
 
     model_module = instantiate(
@@ -377,6 +422,12 @@ def main(cfg: DictConfig) -> None:
         mlflow_logging=cfg.logger.mlflow_logging,
         log_every_n_steps=cfg.logger.log_every_n_steps,
         weight_decay=cfg.model.weight_decay,
+        dino_loss_weight=cfg.model.dino_loss_weight,
+        ibot_loss_weight=cfg.model.ibot_loss_weight,
+        region_loss_weight=cfg.model.region_loss_weight,
+        koleo_loss_weight=cfg.model.koleo_loss_weight,
+        koleo_distance_floor=cfg.model.koleo_distance_floor,
+        loss_ema_decay=cfg.model.loss_ema_decay,
         visual_log_every_n_steps=cfg.logger.visual_log_every_n_steps,
     )
 
@@ -393,6 +444,8 @@ def main(cfg: DictConfig) -> None:
         use_distributed_sampler=False,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         num_sanity_val_steps=cfg.training.num_sanity_val_steps,
+        gradient_clip_val=cfg.training.gradient_clip_val,
+        gradient_clip_algorithm=cfg.training.gradient_clip_algorithm,
     )
 
     if trainer.is_global_zero:

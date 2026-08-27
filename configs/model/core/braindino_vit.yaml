@@ -8,6 +8,7 @@ _pretrain_net:
   learn_sigma: ${model.learn_sigma}
   cls_projection_dim: ${model.cls_projection_dim}
   patch_projection_dim: ${model.patch_projection_dim}
+  gradient_checkpointing: ${model.gradient_checkpointing}
 
 _seg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.seg_net}
