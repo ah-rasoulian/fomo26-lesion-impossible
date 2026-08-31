@@ -31,6 +31,13 @@ class PatchEmbedOutput:
     tokens: torch.Tensor
     grid_shape: Tuple[int, int, int]
     grid_spacing_mm: torch.Tensor
+    original_spatial_shapes: torch.Tensor
+    processed_spatial_shapes: torch.Tensor
+    stride_vox: torch.Tensor
+    effective_kernel_size_vox: torch.Tensor
+    padding_vox: torch.Tensor
+    cropping_vox: torch.Tensor
+    interpolation_applied: torch.Tensor
 
 
 @dataclass
@@ -42,6 +49,13 @@ class ViTFeatures:
     grid_spacing_mm: torch.Tensor
     feature_map: Optional[torch.Tensor]
     intermediate_feature_maps: Tuple[torch.Tensor, ...]
+    original_spatial_shapes: torch.Tensor
+    processed_spatial_shapes: torch.Tensor
+    stride_vox: torch.Tensor
+    effective_kernel_size_vox: torch.Tensor
+    padding_vox: torch.Tensor
+    cropping_vox: torch.Tensor
+    interpolation_applied: torch.Tensor
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -52,6 +66,13 @@ class ViTFeatures:
             "grid_spacing_mm": self.grid_spacing_mm,
             "feature_map": self.feature_map,
             "intermediate_feature_maps": self.intermediate_feature_maps,
+            "original_spatial_shapes": self.original_spatial_shapes,
+            "processed_spatial_shapes": self.processed_spatial_shapes,
+            "stride_vox": self.stride_vox,
+            "effective_kernel_size_vox": self.effective_kernel_size_vox,
+            "padding_vox": self.padding_vox,
+            "cropping_vox": self.cropping_vox,
+            "interpolation_applied": self.interpolation_applied,
         }
 
 
@@ -247,10 +268,29 @@ class SpacingAwarePatchEmbed3d(nn.Module):
             channels,
             3,
         )[:, 0]
+
+        def first_channel(value: torch.Tensor) -> torch.Tensor:
+            return value.reshape(batch_size, channels, *value.shape[1:])[:, 0]
+
         return PatchEmbedOutput(
             tokens=self.norm(tokens),
             grid_shape=projection.grid_shape,
             grid_spacing_mm=grid_spacing_mm,
+            original_spatial_shapes=first_channel(
+                projection.original_spatial_shapes
+            ),
+            processed_spatial_shapes=first_channel(
+                projection.processed_spatial_shapes
+            ),
+            stride_vox=first_channel(projection.stride_vox),
+            effective_kernel_size_vox=first_channel(
+                projection.effective_kernel_size_vox
+            ),
+            padding_vox=first_channel(projection.padding_vox),
+            cropping_vox=first_channel(projection.cropping_vox),
+            interpolation_applied=first_channel(
+                projection.interpolation_applied
+            ),
         )
 
 
@@ -799,6 +839,13 @@ class SpacingAwareViT3d(nn.Module):
             grid_spacing_mm=embedded.grid_spacing_mm,
             feature_map=feature_map,
             intermediate_feature_maps=tuple(intermediate),
+            original_spatial_shapes=embedded.original_spatial_shapes,
+            processed_spatial_shapes=embedded.processed_spatial_shapes,
+            stride_vox=embedded.stride_vox,
+            effective_kernel_size_vox=embedded.effective_kernel_size_vox,
+            padding_vox=embedded.padding_vox,
+            cropping_vox=embedded.cropping_vox,
+            interpolation_applied=embedded.interpolation_applied,
         )
 
     def forward(

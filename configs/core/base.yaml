@@ -47,7 +47,6 @@ lightning:
     num_workers: ${eval:${hardware.num_workers} // ${hardware.num_devices}}
   _lightning_module:
     _target_: asparagus.modules.lightning_modules.${lightning.lightning_module}
-    warmup_epochs: ${training.warmup_epochs}
     compile_mode: ${hardware.compile_mode}
   _trainer:
     _target_: lightning.Trainer

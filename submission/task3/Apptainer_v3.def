@@ -1,0 +1,135 @@
+Bootstrap: docker
+
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author Amirhossein Rasoulian
+    Challenge FOMO26
+    Task Task 3 - Brain Age Regression
+    Version v2.0.0
+    Description BrainDINO ViT-S full-volume brain-age regression model
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Writable runtime caches.
+    export XDG_CACHE_HOME=/tmp/.cache
+    export MPLCONFIGDIR=/tmp/matplotlib
+    export TORCH_HOME=/tmp/torch
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+
+    # Model location inside the immutable image.
+    export MODEL_DIR=/app/model
+    export CHECKPOINT_NAME=best
+
+    # Required Asparagus paths.
+    export ASPARAGUS_DATA=/input
+    export ASPARAGUS_MODELS=/app/model
+    export ASPARAGUS_RESULTS=/output
+    export ASPARAGUS_CONFIGS=/app/configs
+    export ASPARAGUS_RAW_LABELS=/app/raw_labels
+
+    export ASPARAGUS_PRETRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_TRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_FINETUNE_CONFIGS=/app/configs
+    export ASPARAGUS_EVAL_BOX_CONFIGS=/app/configs
+
+    export WANDB_MODE=disabled
+    export WANDB_SILENT=true
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+
+%files
+    # Build from:
+    # /scratch/01/ahrasoulian/projects/fomo26
+
+    # Challenge entry point.
+    fomo26-lesion-impossible/submission/task3/predict_v3.py /app/predict.py
+
+    # Python requirements.
+    fomo26-lesion-impossible/requirements.txt /app/requirements.txt
+
+    # Application source and Hydra configurations.
+    fomo26-lesion-impossible/asparagus /app/asparagus
+    fomo26-lesion-impossible/configs /app/configs
+
+    # FINAL TASK 3 RUN DIRECTORY.
+    # This directory must contain checkpoints/best.ckpt and either
+    # hydra/config.yaml or .hydra/config.yaml. Change this source path if your
+    # final refit was saved elsewhere.
+    models/REGR002_FOMO26_BrainAge/task_vit_s_reg__3D/script=finetune_reg/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/task3_brain_age.yaml__clargs=/split_95_05_00__fold=4/run_id=211683 /app/model
+
+%post
+    set -eu
+
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p \
+        /app/raw_labels \
+        /tmp/.cache \
+        /tmp/matplotlib \
+        /tmp/torch \
+        /tmp/torchinductor_cache \
+        /tmp/triton_cache
+
+    # Retain PyTorch, CUDA, and Triton from the CUDA base image.
+    grep -viE \
+        '^[[:space:]]*(torch|torchvision|torchaudio|triton|nvidia-[A-Za-z0-9_.-]+)([<>=!~[:space:]].*)?$' \
+        /app/requirements.txt \
+        > /app/requirements-runtime.txt
+
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --prefer-binary \
+        -r /app/requirements-runtime.txt
+
+    chmod +x /app/predict.py
+
+    # Fail the build early if the final model bundle is incomplete.
+    test -f /app/model/checkpoints/best.ckpt
+    test -f /app/model/hydra/config.yaml || \
+        test -f /app/model/.hydra/config.yaml
+
+%test
+    python -c "import torch; import lightning; import hydra; import nibabel"
+    test -f /app/model/checkpoints/best.ckpt
+    test -f /app/model/hydra/config.yaml || \
+        test -f /app/model/.hydra/config.yaml
+    python /app/predict.py --help >/dev/null
+
+%runscript
+    exec python /app/predict.py "$@"
+
+%help
+    This container runs the FOMO26 Task 3 BrainDINO ViT-S brain-age model.
+
+    Build from /scratch/01/ahrasoulian/projects/fomo26:
+
+        apptainer build --fakeroot task3_v2.sif \
+            fomo26-lesion-impossible/submission/task3/Apptainer.def
+
+    Run:
+
+        apptainer run --nv \
+            --bind /path/to/input:/input:ro \
+            --bind /path/to/output:/output \
+            task3_v2.sif \
+            --t1 /input/t1.nii.gz \
+            --output /output/age_prediction.txt

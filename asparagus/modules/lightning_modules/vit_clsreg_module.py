@@ -14,15 +14,46 @@ from asparagus.modules.lightning_modules.vit_task_base_module import (
 from gardening_tools.functional.paths.write import save_json
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
-    BinaryF1Score,
+    BinaryAUROC,
+    BinaryAccuracy,
     BinaryPrecision,
     BinaryRecall,
+    BinaryF1Score,
     MulticlassAccuracy,
     MulticlassAUROC,
     MulticlassPrecision,
     MulticlassRecall,
 )
-from torchmetrics.regression import MeanAbsoluteError, MeanSquaredError
+import math
+from torchmetrics.regression import (
+    MeanAbsoluteError,
+    MeanSquaredError,
+    R2Score,
+)
+
+
+class ViTLinearProbModule(ViTTaskBaseModule):
+    """Inference-only Lightning module that exports raw CLS embeddings."""
+
+    def training_step(self, batch, batch_idx):
+        raise RuntimeError("ViTLinearProbModule is inference-only.")
+
+    def validation_step(self, batch, batch_idx):
+        raise RuntimeError("ViTLinearProbModule is inference-only.")
+
+    def predict_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> torch.Tensor:
+        embedding = self.forward_batch(batch)
+        if embedding.ndim != 2:
+            raise RuntimeError(
+                "ViTLinearProbModel must return [B, E], got "
+                f"{tuple(embedding.shape)}."
+            )
+        return embedding.float()
 
 
 class ViTClsRegModule(ViTTaskBaseModule):
@@ -154,19 +185,14 @@ class ViTClsRegModule(ViTTaskBaseModule):
             and self.current_epoch % self.log_image_every_n_epochs == 0
             and self.logger is not None
         ):
+            visualization_batch = self._prepare_visualization_batch(
+                batch=batch,
+                target=target,
+                outputs=outputs,
+            )
+
             self._log_dict_of_images_to_wandb(
-                {
-                    "input": (
-                        batch["image"]
-                        .detach()
-                        .float()
-                        .cpu()
-                        .numpy()
-                    ),
-                    "target": target.detach().float().cpu().numpy(),
-                    "output": outputs.detach().float().cpu().numpy(),
-                    "file": batch["file_path"],
-                },
+                visualization_batch,
                 log_key=stage,
                 task_type=self.task_type,
             )
@@ -214,6 +240,109 @@ class ViTClsRegModule(ViTTaskBaseModule):
             raise FloatingPointError(
                 "The model produced non-finite outputs."
             )
+
+    @staticmethod
+    def _prepare_visualization_batch(
+            batch: Mapping[str, Any],
+            target: torch.Tensor,
+            outputs: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Prepare one unpadded subject for image logging.
+
+        Full-volume batches contain high-end padding so subjects with different
+        spatial dimensions can be stacked. Logging the padded batch directly can
+        select slices from padding and make the anatomy appear displaced,
+        truncated, or empty.
+        """
+        image = batch["image"]
+
+        if image.ndim != 5:
+            raise ValueError(
+                "Expected batch image with shape [B, C, H, W, D], "
+                f"received {tuple(image.shape)}."
+            )
+
+        info = batch.get("info", {})
+        valid_shapes = info.get("valid_spatial_shapes")
+
+        if valid_shapes is None:
+            valid_shape = image.shape[-3:]
+        else:
+            valid_shapes = torch.as_tensor(
+                valid_shapes,
+                device=image.device,
+                dtype=torch.long,
+            )
+
+            if valid_shapes.ndim == 1:
+                valid_shapes = valid_shapes.unsqueeze(0)
+
+            if valid_shapes.shape != (image.shape[0], 3):
+                raise ValueError(
+                    "valid_spatial_shapes must have shape [B, 3], "
+                    f"received {tuple(valid_shapes.shape)}."
+                )
+
+            valid_shape = tuple(
+                int(value)
+                for value in valid_shapes[0].detach().cpu().tolist()
+            )
+
+        height, width, depth = valid_shape
+
+        if (
+                height < 1
+                or width < 1
+                or depth < 1
+                or height > image.shape[2]
+                or width > image.shape[3]
+                or depth > image.shape[4]
+        ):
+            raise ValueError(
+                f"Invalid visualization shape {valid_shape} for "
+                f"batched image shape {tuple(image.shape)}."
+            )
+
+        # Log only one subject because different subjects can have different
+        # unpadded dimensions and therefore cannot be stacked after cropping.
+        visualization_image = image[
+            0:1,
+            :,
+            :height,
+            :width,
+            :depth,
+        ]
+
+        file_paths = batch.get("file_path", [])
+        if isinstance(file_paths, (list, tuple)):
+            visualization_files = list(file_paths[:1])
+        else:
+            visualization_files = [file_paths]
+
+        return {
+            "input": (
+                visualization_image
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            ),
+            "target": (
+                target[0:1]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            ),
+            "output": (
+                outputs[0:1]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            ),
+            "file": visualization_files,
+        }
 
     def training_step(
         self,
@@ -417,19 +546,23 @@ class ViTClassificationModule(ViTClsRegModule):
             f"Unsupported stage: {stage}."
         )
 
-    def configure_metrics(
-        self,
-        prefix: str,
-    ) -> MetricCollection:
+    def configure_metrics(self, prefix: str) -> MetricCollection:
+        if self.num_classes == 2:
+            return MetricCollection(
+                {
+                    f"{prefix}/acc": BinaryAccuracy(),
+                    f"{prefix}/auroc": BinaryAUROC(),
+                }
+            )
         return MetricCollection(
             {
                 f"{prefix}/acc": MulticlassAccuracy(
                     num_classes=self.num_classes,
-                    average=None,
+                    average="macro",
                 ),
                 f"{prefix}/auroc": MulticlassAUROC(
                     num_classes=self.num_classes,
-                    average=None,
+                    average="macro",
                 ),
             }
         )
@@ -451,13 +584,14 @@ class ViTClassificationModule(ViTClsRegModule):
         )
 
     def prepare_metric_inputs(
-        self,
-        outputs: torch.Tensor,
-        target: torch.Tensor,
+            self,
+            outputs: torch.Tensor,
+            target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Match the default ClsReg module: multiclass metrics receive
-        # [B, C] logits and integer class indices, including when C=2.
-        return outputs, target
+        probabilities = outputs.softmax(dim=-1)
+        if self.num_classes == 2:
+            return probabilities[:, self.positive_class_index], target
+        return probabilities, target
 
     def _record_test_batch(
         self,
@@ -529,49 +663,103 @@ class ViTRegressionModule(ViTClsRegModule):
     def __init__(
         self,
         *args,
+        target_mean: float = 0.0,
+        target_std: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        if not math.isfinite(target_mean):
+            raise ValueError(
+                f"target_mean must be finite, got {target_mean}."
+            )
+
+        if not math.isfinite(target_std) or target_std <= 0.0:
+            raise ValueError(
+                "target_std must be finite and positive, "
+                f"got {target_std}."
+            )
+
+        self.register_buffer(
+            "target_mean",
+            torch.tensor(
+                float(target_mean),
+                dtype=torch.float32,
+            ),
+        )
+        self.register_buffer(
+            "target_std",
+            torch.tensor(
+                float(target_std),
+                dtype=torch.float32,
+            ),
+        )
+
+        # MSE is now calculated in standardized target space.
         self.loss = nn.MSELoss()
         self.task_type = "regression"
         self._initialize_metrics()
+
+    def normalize_target(
+        self,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            target - self.target_mean
+        ) / self.target_std
+
+    def denormalize_target(
+        self,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            target * self.target_std
+            + self.target_mean
+        )
 
     def prepare_target(
         self,
         target: torch.Tensor,
     ) -> torch.Tensor:
-        # Retain [B, output_dim], including B=1 and output_dim=1.
-        return target.float().reshape(
+        target = target.float().reshape(
             -1,
             self.num_outputs,
         )
+        return self.normalize_target(target)
 
     def configure_metrics(
-        self,
-        prefix: str,
+            self,
+            prefix: str,
     ) -> MetricCollection:
         return MetricCollection(
             {
-                f"{prefix}/MSE": MeanSquaredError(
-                    num_outputs=self.num_outputs,
-                ),
+                f"{prefix}/MAE": MeanAbsoluteError(),
+                f"{prefix}/MSE": MeanSquaredError(),
+                f"{prefix}/R2": R2Score(),
             }
         )
 
     def configure_test_metrics(
-        self,
+            self,
     ) -> MetricCollection:
         return MetricCollection(
             {
-                "MSE": MeanSquaredError(
-                    num_outputs=self.num_outputs,
-                ),
-                "MAE": MeanAbsoluteError(
-                    num_outputs=self.num_outputs,
-                ),
+                "MAE": MeanAbsoluteError(),
+                "MSE": MeanSquaredError(),
+                "R2": R2Score(),
             }
         )
+
+    def prepare_metric_inputs(
+        self,
+        outputs: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Metrics are reported in years.
+        predictions_years = self.denormalize_target(outputs)
+        targets_years = self.denormalize_target(target)
+
+        return predictions_years, targets_years
 
     def _record_test_batch(
         self,
@@ -579,19 +767,22 @@ class ViTRegressionModule(ViTClsRegModule):
         target: torch.Tensor,
         batch: Mapping[str, Any],
     ) -> None:
+        outputs_years = self.denormalize_target(outputs)
+        targets_years = self.denormalize_target(target)
+
         file_paths = batch["file_path"]
         if not isinstance(file_paths, (list, tuple)):
             file_paths = [file_paths]
 
         for index, file_path in enumerate(file_paths):
             prediction_values = (
-                outputs[index]
+                outputs_years[index]
                 .detach()
                 .cpu()
                 .tolist()
             )
             target_values = (
-                target[index]
+                targets_years[index]
                 .detach()
                 .cpu()
                 .tolist()
@@ -611,10 +802,21 @@ class ViTRegressionModule(ViTClsRegModule):
             }
 
         self.predictions.append(
-            outputs.detach().cpu()
+            outputs_years.detach().cpu()
         )
         self.labels.append(
-            target.detach().cpu()
+            targets_years.detach().cpu()
+        )
+
+    def predict_step(
+        self,
+        batch: Mapping[str, Any],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> torch.Tensor:
+        normalized_predictions = self.forward_batch(batch)
+        return self.denormalize_target(
+            normalized_predictions
         )
 
 

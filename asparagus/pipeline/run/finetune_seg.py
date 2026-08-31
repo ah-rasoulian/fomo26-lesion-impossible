@@ -1,10 +1,11 @@
-import hydra
-import lightning as pl
+from __future__ import annotations
+
 import os
 import random
+import hydra
+import lightning as pl
 from asparagus.functional.versioning import generate_unused_run_id
 from asparagus.modules.hydra.plugins.searchpath_plugins import FinetuneSearchpathPlugin
-from asparagus.modules.transforms.presets import CPU_seg_test_transforms
 from asparagus.paths import get_config_path
 from asparagus.pipeline.auto_configuration.checkpoint import resolve_checkpoint
 from asparagus.pipeline.auto_configuration.experiment_setup import (
@@ -12,7 +13,6 @@ from asparagus.pipeline.auto_configuration.experiment_setup import (
 )
 from asparagus.pipeline.auto_configuration.logging import logging
 from dotenv import load_dotenv
-from gardening_tools.modules.networks.components.weight_init import set_params_to_zero
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.plugins import Plugins
 from hydra.utils import instantiate
@@ -23,11 +23,22 @@ from lightning.pytorch.callbacks import (
 )
 from omegaconf import DictConfig, OmegaConf
 
-load_dotenv()
 
-OmegaConf.register_new_resolver("random", lambda min, max: random.randint(min, max))
-OmegaConf.register_new_resolver("version", lambda: generate_unused_run_id(), use_cache=True)
+load_dotenv()
+OmegaConf.register_new_resolver(
+    "random", lambda minimum, maximum: random.randint(minimum, maximum)
+)
+OmegaConf.register_new_resolver(
+    "version", lambda: generate_unused_run_id(), use_cache=True
+)
 OmegaConf.register_new_resolver("eval", eval)
+OmegaConf.register_new_resolver(
+    "ceil_div",
+    lambda numerator, denominator: (
+        int(numerator) + int(denominator) - 1
+    )
+    // int(denominator),
+)
 Plugins.instance().register(FinetuneSearchpathPlugin)
 
 
@@ -37,13 +48,15 @@ Plugins.instance().register(FinetuneSearchpathPlugin)
     version_base="1.2",
 )
 def main(cfg: DictConfig) -> None:
-    print(f"{OmegaConf.to_yaml(cfg)}\n Version: {cfg.run_id}\n Run dir: {HydraConfig.get().run.dir}\n")
-    logging_safe_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    file_store, path_store, version_store = prepare_standard_experiment(cfg)
-    weights = resolve_checkpoint(cfg)
-    pl.seed_everything(seed=cfg.training.seed, workers=True)
+    print(f"Version: {cfg.run_id}")
+    print(f"Run dir: {HydraConfig.get().run.dir}")
 
-    assert "load_checkpoint_name" in cfg.keys(), "load_checkpoint_name not in config. Did you supply a scratch config?"
+    logging_safe_cfg = OmegaConf.to_container(
+        cfg, resolve=True, throw_on_missing=True
+    )
+    file_store, path_store, version_store = prepare_standard_experiment(cfg)
+    pretrained_weights = resolve_checkpoint(cfg)
+    pl.seed_everything(int(cfg.training.seed), workers=True)
 
     loggers = logging(
         ckpt_wandb_id=version_store.wandb_id,
@@ -59,109 +72,165 @@ def main(cfg: DictConfig) -> None:
         log_to_stdout=cfg.logger.log_to_stdout,
     )
 
-    best_ckpt_callback = ModelCheckpoint(
+    best_checkpoint = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
-        monitor="val/loss",
-        mode="min",
+        monitor="val/dice",
+        mode="max",
         save_top_k=1,
+        save_last=True,
         filename="best",
+        save_on_train_epoch_end=False,
         enable_version_counter=False,
     )
-    last_ckpt_callback = ModelCheckpoint(
-        dirpath=path_store.ckpt_save_dir,
-        every_n_epochs=cfg.model.ckpt_every_n_epoch,
-        save_top_k=1,
-        filename="last",
-        enable_version_counter=False,
-    )
+    callbacks = [
+        best_checkpoint,
+        TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps),
+        LearningRateMonitor(
+            logging_interval="step",
+            log_momentum=True,
+            log_weight_decay=True,
+        ),
+    ]
 
-    progressbar_callback = TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps)
-    lr_monitor_callback = LearningRateMonitor(logging_interval="epoch", log_momentum=True)
-    profilers = None
-
-    cpu_tr_transforms = instantiate(
+    cpu_train_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
-        patch_size=cfg.training.patch_size,
+        normalize=cfg.transforms.normalize,
+        affine_probability=cfg.transforms.affine_probability,
+        rotation_degrees=cfg.transforms.rotation_degrees,
+        scale_range=cfg.transforms.scale_range,
+        translation_fraction=cfg.transforms.translation_fraction,
+        flip_probability=cfg.transforms.flip_probability,
     )
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
-        patch_size=cfg.training.patch_size,
+        normalize=cfg.transforms.normalize,
     )
-    gpu_tr_transforms = instantiate(
+    gpu_train_transforms = instantiate(
         cfg.transforms._gpu_tr_transforms,
-        ndim=len(cfg.training.patch_size),
-        deep_supervision=cfg.model.deep_supervision,
+        ndim=3,
     )
 
     data_module = instantiate(
         cfg.lightning._data_module,
-        train_split=file_store.splits["train"],
-        val_split=file_store.splits["val"],
-        train_transforms=cpu_tr_transforms,
+        train_split=list(file_store.splits["train"]),
+        val_split=list(file_store.splits["val"]),
+        train_transforms=cpu_train_transforms,
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
-        test_transforms=CPU_seg_test_transforms(patch_size=cfg.training.patch_size),
+        test_transforms=cpu_val_transforms,
+        train_num_samples=cfg.training.samples_per_epoch,
+        sampler_seed=cfg.training.seed,
     )
+
+    num_classes = int(cfg.model.output_channels)
+    if num_classes < 2:
+        raise ValueError(
+            "model.output_channels is the total class count including "
+            "background and must be at least 2."
+        )
+    metadata = file_store.dataset_json.get("metadata", {})
+    metadata_classes = metadata.get("n_classes")
+    if metadata_classes is not None:
+        metadata_classes = int(metadata_classes)
+        if metadata_classes not in (num_classes, num_classes - 1):
+            raise ValueError(
+                "Configured output channels disagree with dataset metadata: "
+                f"output_channels={num_classes}, n_classes={metadata_classes}."
+            )
 
     model = instantiate(
         cfg.model._seg_net,
-        input_channels=file_store.dataset_json["metadata"]["n_modalities"],
-        output_channels=file_store.dataset_json["metadata"]["n_classes"],
+        output_channels=num_classes,
+        trainable_backbone_blocks=cfg.model.trainable_backbone_blocks,
+        initial_foreground_probability=(
+            cfg.model.initial_foreground_probability
+        ),
     )
+
+    head_lr = float(cfg.model.finetune_lr)
+
+    backbone_is_trainable = not model.backbone_is_frozen
+
+    if backbone_is_trainable:
+        backbone_lr_multiplier = float(
+            cfg.model.backbone_lr_multiplier
+        )
+        if backbone_lr_multiplier <= 0.0:
+            raise ValueError(
+                "backbone_lr_multiplier must be positive when any "
+                "backbone parameters are trainable."
+            )
+
+        backbone_lr = head_lr * backbone_lr_multiplier
+    else:
+        backbone_lr = None
 
     model_module = instantiate(
         cfg.lightning._lightning_module,
         model=model,
-        warmup_epochs=cfg.training.warmup_epochs,
-        decoder_warmup_epochs=cfg.training.decoder_warmup_epochs,
-        weights=weights,
-        train_transforms=gpu_tr_transforms,
-        val_transforms=None,
+        weights=pretrained_weights,
+        min_backbone_load_fraction=cfg.model.min_backbone_load_fraction,
+        learning_rate=head_lr,
+        backbone_learning_rate=backbone_lr,
+        warmup_ratio=cfg.model.warmup_ratio,
+        cosine_period_ratio=cfg.model.cosine_period_ratio,
+        minimum_lr=cfg.model.minimum_lr,
         optimizer=cfg.model.finetune_optim,
-        learning_rate=cfg.model.finetune_lr,
-        deep_supervision=cfg.model.deep_supervision,
-        inference_patch_size=cfg.training.patch_size,
+        weight_decay=cfg.model.finetune_weight_decay,
+        momentum=cfg.model.momentum,
+        nesterov=cfg.model.nesterov,
+        compile_mode=cfg.model.get("compile_mode"),
+        train_transforms=gpu_train_transforms,
+        val_transforms=None,
+        test_transforms=None,
+        num_classes=num_classes,
+        label_key=cfg.training.label_key,
+        ce_weight=cfg.training.ce_weight,
+        dice_weight=cfg.training.dice_weight,
+        class_weights=cfg.training.class_weights,
+        include_background_in_dice=cfg.training.include_background_in_dice,
+        log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
         test_output_path=os.path.join(
             path_store.run_dir,
             "predictions",
-            cfg.test_task + "__" + cfg.data.test_split + "__" + "best.json",
+            str(cfg.test_task or cfg.task)
+            + (f"__{cfg.data.test_split}" if cfg.data.test_split else "")
+            + "__best.json",
         ),
-        load_decoder=cfg.training.load_decoder,
-        repeat_stem_weights=cfg.training.repeat_stem_weights,
     )
 
     trainer = instantiate(
         cfg.lightning._trainer,
-        callbacks=[
-            last_ckpt_callback,
-            best_ckpt_callback,
-            progressbar_callback,
-            lr_monitor_callback,
-        ],
+        callbacks=callbacks,
         log_every_n_steps=cfg.logger.log_every_n_steps,
         logger=loggers,
-        profiler=profilers,
+        profiler=None,
         default_root_dir=path_store.run_dir,
         max_epochs=cfg.training.epochs,
-        limit_train_batches=cfg.training.train_batches_per_epoch_per_device,
-        limit_val_batches=cfg.training.val_batches_per_epoch_per_device,
+        limit_train_batches=cfg.training.steps_per_epoch,
+        limit_val_batches=cfg.training.val_steps_per_epoch,
         check_val_every_n_epoch=cfg.training.check_val_every_n_epoch,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         use_distributed_sampler=False,
+        num_sanity_val_steps=cfg.training.num_sanity_val_steps,
+        gradient_clip_val=cfg.training.gradient_clip_val,
+        gradient_clip_algorithm=cfg.training.gradient_clip_algorithm,
     )
 
     trainer.fit(
         model=model_module,
         datamodule=data_module,
+        ckpt_path=cfg.training.resume_ckpt,
     )
 
-    model_module.model.apply(set_params_to_zero)
-
-    trainer.test(
-        model=model_module,
-        datamodule=data_module,
-        ckpt_path=best_ckpt_callback.best_model_path,
-    )
+    if file_store.test:
+        if not best_checkpoint.best_model_path:
+            raise RuntimeError("No best validation-Dice checkpoint was saved.")
+        trainer.test(
+            model=model_module,
+            datamodule=data_module,
+            ckpt_path=best_checkpoint.best_model_path,
+        )
 
 
 if __name__ == "__main__":

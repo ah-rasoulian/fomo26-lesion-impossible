@@ -29,6 +29,11 @@ from .vit_transforms import (
     GPU_vit_all_train_transforms,
 )
 
+from .vit_transforms import (
+    CPU_vit_seg_train_transforms,
+    CPU_vit_seg_val_transforms
+)
+
 __all__ = [
     "none",
     "CPU_clsreg_train_transforms_crop",
@@ -50,4 +55,7 @@ __all__ = [
     "CPU_vit_train_transforms",
     "CPU_vit_val_test_transforms",
     "GPU_vit_all_train_transforms",
+
+    "CPU_vit_seg_train_transforms",
+    "CPU_vit_seg_val_transforms",
 ]

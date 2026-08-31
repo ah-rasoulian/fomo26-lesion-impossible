@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - /vit_finetune
+  - /model/braindino_vit_s@model
+  - _self_
+
+task: REGR002_FOMO26_BrainAge
+root: lesion_impossible
+stem: finetune
+
+checkpoint_run_id: 606554
+load_checkpoint_name: last.ckpt
+
+model:
+  net: ${model.reg_net}
+  output_dim: 1
+  min_backbone_load_fraction: 0.99
+
+  trainable_backbone_blocks: 12
+  backbone_lr_multiplier: 0.01
+
+  # Must match pretraining exactly.
+  grid_size: [24, 24, 24]
+  patch_kernel_size: 8
+  window_size: [4, 4, 4]
+  summary_grid_size: [8, 8, 8]
+
+  # Regression head.
+  reg_hidden_dim: 256
+  reg_dropout: 0.2
+  reg_cls_weight: 0.75
+
+lightning:
+  data_module: ClsRegDataModule
+  lightning_module: ViTRegressionModule

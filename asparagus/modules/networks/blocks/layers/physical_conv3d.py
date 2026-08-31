@@ -61,6 +61,7 @@ class PhysicalConv3dOutput:
     grid_shape: Tuple[int, int, int]
     grid_spacing_mm: torch.Tensor
     stride_vox: torch.Tensor
+    effective_kernel_size_vox: torch.Tensor
     padding_vox: torch.Tensor
     cropping_vox: torch.Tensor
     original_spatial_shapes: torch.Tensor
@@ -113,6 +114,7 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
         offset_mode: OffsetMode = "center",
         padding_mode: PaddingMode = "replicate",
         eps: float = 1e-6,
+        safe_output_channels_per_call: int = 128,
     ) -> None:
         super().__init__()
 
@@ -127,6 +129,11 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
         self.eps = float(eps)
         self.sigma_min_mm = float(sigma_min_mm)
         self.sigma_max_mm = float(sigma_max_mm)
+        # Runtime-only execution setting. It is deliberately not a parameter
+        # or buffer, so old checkpoints retain exactly the same state_dict.
+        self.safe_output_channels_per_call = int(
+            safe_output_channels_per_call
+        )
 
         if offset_mode not in ("center", "random"):
             raise ValueError(f"Unsupported offset_mode: {offset_mode}.")
@@ -134,6 +141,10 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
             raise ValueError(f"Unsupported padding_mode: {padding_mode}.")
         if not 0.0 < self.sigma_min_mm < self.sigma_max_mm:
             raise ValueError("Require 0 < sigma_min_mm < sigma_max_mm.")
+        if self.safe_output_channels_per_call < 1:
+            raise ValueError(
+                "safe_output_channels_per_call must be positive."
+            )
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -374,42 +385,145 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
         spacing: torch.Tensor,
         geometry: ConvGeometry3d,
     ) -> torch.Tensor:
-        batch_size = x.shape[0]
-        masks = self.make_masks(spacing)
-        weight_effective = (
-            self.weight.unsqueeze(0) * masks[:, None, None, :, :, :]
-        )
-        weight_grouped = weight_effective.reshape(
-            batch_size * self.out_channels,
-            self.in_channels,
-            *self.kernel_size,
-        )
-        bias_grouped = (
-            self.bias.repeat(batch_size) if self.bias is not None else None
-        )
+        """Apply exactly the original masked convolution with safer dispatch.
 
+        When all rows share spacing, all effective kernels are identical. In
+        that common case, keeping samples in the real batch dimension is both
+        faster and more cuDNN-friendly than converting the batch into groups.
+
+        A single large volume cannot be split along its batch dimension by
+        older cuDNN versions. For that case only, split the output filters into
+        bounded chunks and concatenate their outputs. Every chunk uses the
+        same input, stride, dilation, Gaussian mask, weights, and bias as the
+        original convolution, so this does not change the model function.
+        """
+        batch_size = x.shape[0]
         x = self._crop_and_pad(x, geometry)
-        x_grouped = x.reshape(
-            1,
-            batch_size * self.in_channels,
-            *x.shape[2:],
+
+        shared_spacing = batch_size == 1 or torch.equal(
+            spacing,
+            spacing[0:1].expand_as(spacing),
         )
-        y = F.conv3d(
-            x_grouped,
-            weight_grouped,
-            bias=bias_grouped,
-            stride=geometry.stride,
-            padding=0,
-            dilation=self.dilation,
-            groups=batch_size,
-        )
-        y = y.reshape(batch_size, self.out_channels, *y.shape[2:])
+        if shared_spacing:
+            y = self._shared_kernel_convolution(
+                x=x,
+                spacing=spacing[0:1],
+                geometry=geometry,
+                split_output_channels=(batch_size == 1),
+            )
+        else:
+            y = self._per_sample_kernel_convolution(
+                x=x,
+                spacing=spacing,
+                geometry=geometry,
+            )
+
         actual_grid = tuple(int(item) for item in y.shape[2:])
         if actual_grid != self.grid_size:
             raise RuntimeError(
                 f"Expected convolution grid {self.grid_size}, got {actual_grid}."
             )
         return y
+
+    def _output_channel_slices(
+        self,
+        split: bool,
+    ) -> list[Tuple[int, int]]:
+        step = (
+            min(self.out_channels, self.safe_output_channels_per_call)
+            if split
+            else self.out_channels
+        )
+        return [
+            (start, min(start + step, self.out_channels))
+            for start in range(0, self.out_channels, step)
+        ]
+
+    def _shared_kernel_convolution(
+        self,
+        x: torch.Tensor,
+        spacing: torch.Tensor,
+        geometry: ConvGeometry3d,
+        split_output_channels: bool,
+    ) -> torch.Tensor:
+        """Fast path: one effective kernel shared across the real batch."""
+        mask = self.make_masks(spacing)[0]
+        outputs = []
+        for start, end in self._output_channel_slices(
+            split_output_channels
+        ):
+            weight = (
+                self.weight[start:end]
+                * mask[None, None, :, :, :]
+            )
+            bias = (
+                self.bias[start:end]
+                if self.bias is not None
+                else None
+            )
+            outputs.append(
+                F.conv3d(
+                    x,
+                    weight,
+                    bias=bias,
+                    stride=geometry.stride,
+                    padding=0,
+                    dilation=self.dilation,
+                    groups=1,
+                )
+            )
+        return torch.cat(outputs, dim=1)
+
+    def _per_sample_kernel_convolution(
+        self,
+        x: torch.Tensor,
+        spacing: torch.Tensor,
+        geometry: ConvGeometry3d,
+    ) -> torch.Tensor:
+        """General path for different physical kernels in one shape group."""
+        batch_size = x.shape[0]
+        masks = self.make_masks(spacing)
+        x_grouped = x.reshape(
+            1,
+            batch_size * self.in_channels,
+            *x.shape[2:],
+        )
+
+        outputs = []
+        # The grouped representation always has pseudo-batch size one, so use
+        # bounded output chunks to avoid large non-batch-splittable cuDNN ops.
+        for start, end in self._output_channel_slices(split=True):
+            chunk_channels = end - start
+            weight = (
+                self.weight[start:end].unsqueeze(0)
+                * masks[:, None, None, :, :, :]
+            ).reshape(
+                batch_size * chunk_channels,
+                self.in_channels,
+                *self.kernel_size,
+            )
+            bias = (
+                self.bias[start:end].repeat(batch_size)
+                if self.bias is not None
+                else None
+            )
+            output = F.conv3d(
+                x_grouped,
+                weight,
+                bias=bias,
+                stride=geometry.stride,
+                padding=0,
+                dilation=self.dilation,
+                groups=batch_size,
+            )
+            outputs.append(
+                output.reshape(
+                    batch_size,
+                    chunk_channels,
+                    *output.shape[2:],
+                )
+            )
+        return torch.cat(outputs, dim=1)
 
     def _prepare_valid_shapes(
         self,
@@ -522,6 +636,11 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
                     processed_spacing * stride.to(processed_spacing.dtype)
                 ),
                 stride_vox=stride,
+                effective_kernel_size_vox=torch.tensor(
+                    self.effective_kernel_size(),
+                    device=x.device,
+                    dtype=torch.long,
+                ).unsqueeze(0).expand(batch_size, -1),
                 padding_vox=padding,
                 cropping_vox=cropping,
                 original_spatial_shapes=original_shapes.to(x.device),
@@ -602,6 +721,11 @@ class PhysicalGaussianMaskedConv3d(nn.Module):
                 * stride_rows.to(processed_spacing_rows.dtype)
             ),
             stride_vox=stride_rows,
+            effective_kernel_size_vox=torch.tensor(
+                self.effective_kernel_size(),
+                device=x.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(batch_size, -1),
             padding_vox=padding_rows,
             cropping_vox=cropping_rows,
             original_spatial_shapes=original_shapes.to(x.device),
@@ -636,6 +760,50 @@ def _smoke_test() -> None:
     assert torch.allclose(output.grid_spacing_mm[0, 0], torch.tensor(1.0))
     assert torch.allclose(output.grid_spacing_mm[1, 0], torch.tensor(2.0))
     assert output.interpolation_applied.tolist() == [True, True]
+
+    # Verify the shared-kernel chunked path against the original grouped
+    # formulation and confirm that no new state_dict entries were introduced.
+    chunked = PhysicalGaussianMaskedConv3d(
+        in_channels=1,
+        out_channels=5,
+        kernel_size=2,
+        grid_size=(4, 4, 4),
+        offset_mode="center",
+        safe_output_channels_per_call=2,
+    ).eval()
+    state_keys = set(chunked.state_dict())
+    assert state_keys == {"weight", "bias", "raw_sigma", "offsets"}
+
+    image = torch.randn(1, 1, 8, 8, 8)
+    shared_spacing = torch.ones(1, 3)
+    geometry = chunked.compute_geometry((8, 8, 8))
+    optimized = chunked._grouped_convolution(
+        image,
+        shared_spacing,
+        geometry,
+    )
+
+    mask = chunked.make_masks(shared_spacing)
+    effective_weight = (
+        chunked.weight.unsqueeze(0)
+        * mask[:, None, None, :, :, :]
+    ).reshape(5, 1, 2, 2, 2)
+    reference = F.conv3d(
+        chunked._crop_and_pad(image, geometry),
+        effective_weight,
+        bias=chunked.bias,
+        stride=geometry.stride,
+    )
+    assert torch.allclose(optimized, reference, atol=1e-6, rtol=1e-5)
+
+    clone = PhysicalGaussianMaskedConv3d(
+        in_channels=1,
+        out_channels=5,
+        kernel_size=2,
+        grid_size=(4, 4, 4),
+        safe_output_channels_per_call=3,
+    )
+    clone.load_state_dict(chunked.state_dict(), strict=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - /vit_finetune
+  - /model/braindino_vit_s@model
+  - _self_
+
+task: CLS003_FOMO26_Polymicrogyria
+root: lesion_impossible
+stem: finetune
+checkpoint_run_id: 606554
+load_checkpoint_name: "last.ckpt"
+
+model:
+  net: ${model.cls_net}
+  min_backbone_load_fraction: 0.99
+  trainable_backbone_blocks: 4
+  backbone_lr_multiplier: 0.03
+
+  grid_size: [24, 24, 24]
+  patch_kernel_size: 8
+  window_size: [4, 4, 4]
+  summary_grid_size: [8, 8, 8]
+
+  cls_hidden_dim: 256
+  cls_dropout: 0.35
+  cls_top_k_fraction: 0.005
+  cls_min_top_k: 32
+  cls_token_logit_weight: 0.8
+
+lightning:
+  data_module: ClsRegDataModule
+  lightning_module: ViTClassificationModule

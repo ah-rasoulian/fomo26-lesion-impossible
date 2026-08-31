@@ -11,14 +11,18 @@ _pretrain_net:
   gradient_checkpointing: ${model.gradient_checkpointing}
 
 _seg_net:
-  _target_: asparagus.modules.networks.vit_task_model.${model.seg_net}
+  _target_: asparagus.modules.networks.vit_task_model.task_vit_s_seg
   grid_size: ${model.grid_size}
   patch_kernel_size: ${model.patch_kernel_size}
   window_size: ${model.window_size}
   summary_grid_size: ${model.summary_grid_size}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
+  output_channels: ${model.output_channels}
+  decoder_hidden_dim: ${model.decoder_hidden_dim}
+  decoder_dropout: ${model.decoder_dropout}
   freeze_backbone: ${model.freeze_backbone}
+  trainable_backbone_blocks: ${model.trainable_backbone_blocks}
 
 _cls_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.cls_net}
@@ -33,7 +37,6 @@ _cls_net:
   top_k_fraction: ${model.cls_top_k_fraction}
   min_top_k: ${model.cls_min_top_k}
   token_logit_weight: ${model.cls_token_logit_weight}
-  freeze_backbone: ${model.freeze_backbone}
 
 _reg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.reg_net}
@@ -43,7 +46,9 @@ _reg_net:
   summary_grid_size: ${model.summary_grid_size}
   init_sigma_mm: ${model.init_sigma_mm}
   learn_sigma: ${model.learn_sigma}
-  freeze_backbone: ${model.freeze_backbone}
+  hidden_dim: ${model.reg_hidden_dim}
+  dropout: ${model.reg_dropout}
+  cls_weight: ${model.reg_cls_weight}
 
 _plugin_seg_net:
   _target_: asparagus.modules.networks.vit_task_model.${model.plugin_seg_net}

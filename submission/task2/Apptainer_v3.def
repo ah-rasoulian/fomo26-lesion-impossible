@@ -1,0 +1,112 @@
+Bootstrap: docker
+
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author Amirhossein Rasoulian
+    Challenge FOMO26
+    Task Task 2 - Meningioma Binary Segmentation
+    Version v3.0.0
+    Description Full-volume BrainDINO ViT segmentation with geometry-aware lightweight decoder
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    export MODEL_DIR=/app/model
+    export CHECKPOINT_NAME=last
+    export INFERENCE_PRECISION=auto
+
+    export ASPARAGUS_DATA=/input
+    export ASPARAGUS_MODELS=/app/model
+    export ASPARAGUS_RESULTS=/output
+    export ASPARAGUS_CONFIGS=/app/configs
+    export ASPARAGUS_RAW_LABELS=/app/raw_labels
+    export ASPARAGUS_PRETRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_TRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_FINETUNE_CONFIGS=/app/configs
+    export ASPARAGUS_EVAL_BOX_CONFIGS=/app/configs
+
+    export WANDB_MODE=disabled
+    export WANDB_SILENT=true
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export CUDA_MODULE_LOADING=LAZY
+
+%files
+    # Build from /scratch/01/ahrasoulian/projects/fomo26.
+    fomo26-lesion-impossible/submission/task2/predict_v3.py /app/predict.py
+    fomo26-lesion-impossible/requirements.txt /app/requirements.txt
+    fomo26-lesion-impossible/asparagus /app/asparagus
+    fomo26-lesion-impossible/configs /app/configs
+
+    # Stable export path for the final v3 run. Before building, make this
+    # directory (or symlink) point to the run containing hydra/config.yaml and
+    # checkpoints/best.ckpt. This avoids embedding Hydra's very long run path
+    # in the definition file.
+    models/SEG009_FOMO26_Meningioma/task_vit_s_seg__3D/script=finetune_seg/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/task2_meningioma_seg.yaml__clargs=/split_95_05_00__fold=4/run_id=787590 /app/model
+
+%post
+    set -eu
+
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    mkdir -p \
+        /app/raw_labels \
+        /input \
+        /output
+
+    # Only packages required by predict_v3.py and the imported model classes.
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --prefer-binary \
+        hydra-core==1.3.2 \
+        omegaconf==2.3.0 \
+        python-dotenv==1.2.2 \
+        PyYAML==6.0.3 \
+        lightning==2.4.0 \
+        torchmetrics==1.9.0 \
+        nibabel==5.4.2 \
+        numpy==2.2.6 \
+        scipy==1.16.3 \
+        scikit-image==0.25.2 \
+        ImageIO==2.37.0 \
+        einops==0.8.1 \
+        tqdm==4.67.1
+
+    # Install the project utility package without allowing it to replace
+    # PyTorch or pull training-only dependencies.
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --no-deps \
+        gardening_tools==0.3.2
+
+    # Torch 2.6.0 requires Torchvision 0.21.0. Install the CUDA 12.4 wheel
+    # without allowing pip to modify the base-image PyTorch installation.
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --no-deps \
+        --force-reinstall \
+        torchvision==0.21.0 \
+        --index-url https://download.pytorch.org/whl/cu124
+
+    chmod 0755 /app/predict.py
+
+%test
+    set -eu
+    export PYTHONPATH=/app
+    python -c "import torch, torchvision, lightning, nibabel, asparagus; print(torch.__version__, torchvision.__version__)"
+    python /app/predict.py --help >/dev/null
+    test -f /app/model/checkpoints/best.ckpt
+    test -f /app/model/hydra/config.yaml -o -f /app/model/.hydra/config.yaml -o -f /app/model/config.yaml
+
+%runscript
+    exec python /app/predict.py "$@"

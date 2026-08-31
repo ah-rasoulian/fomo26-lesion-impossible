@@ -32,21 +32,27 @@ class SegDataModule(pl.LightningDataModule):
         train_transforms: Optional[Compose] = None,
         test_transforms: Optional[Compose] = None,
         val_transforms: Optional[Compose] = None,
+        train_num_samples: Optional[int] = None,
+        sampler_seed: int = 0,
         pin_memory: bool = True,
         persistent_workers: Optional[bool] = None,
         prefetch_factor: int = 2,
-    ):
+    ) -> None:
         super().__init__()
-        self.batch_size = batch_size
-        self.train_transforms = train_transforms
-        self.test_transforms = test_transforms
-        self.val_transforms = val_transforms
-        self.num_workers = num_workers
-        self.train_split = train_split
+        self.batch_size = int(batch_size)
+        self.num_workers = int(num_workers)
+        self.train_split = list(train_split or [])
+        self.val_split = list(val_split or [])
         self.test_samples = list(test_samples or [])
-        self.val_split = val_split
         self.predict_samples = list(predict_samples or [])
+        self.train_transforms = train_transforms
+        self.val_transforms = val_transforms
+        self.test_transforms = test_transforms
         self.predict_transforms = predict_transforms
+        self.train_num_samples = (
+            None if train_num_samples is None else int(train_num_samples)
+        )
+        self.sampler_seed = int(sampler_seed)
         self.pin_memory = bool(pin_memory)
         self.persistent_workers = (
             self.num_workers > 0
@@ -54,70 +60,40 @@ class SegDataModule(pl.LightningDataModule):
             else bool(persistent_workers)
         )
         self.prefetch_factor = int(prefetch_factor)
+
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        if self.num_workers < 0:
+            raise ValueError("num_workers must be non-negative.")
+        if self.train_num_samples is not None and self.train_num_samples < 1:
+            raise ValueError("train_num_samples must be positive.")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be positive.")
         if self.num_workers == 0 and self.persistent_workers:
             raise ValueError("persistent_workers requires num_workers > 0.")
-
-        logging.info(f"Using {self.num_workers} workers")
+        logging.info("Using %d workers", self.num_workers)
 
     def setup(
         self,
         stage: Optional[Literal["fit", "validate", "test", "predict"]] = None,
-    ):
+    ) -> None:
         if stage in (None, "fit", "validate"):
-            self.setup_fit()
+            self.train_dataset = SegDataset(
+                self.train_split, transforms=self.train_transforms
+            )
+            self.val_dataset = SegDataset(
+                self.val_split, transforms=self.val_transforms
+            )
         if stage in (None, "test"):
-            self.setup_test()
+            self.test_dataset = SegTestDataset(
+                self.test_samples, transforms=self.test_transforms
+            )
         if stage in (None, "predict"):
-            self.setup_predict()
+            self.predict_dataset = SingleSubjectPredictDataset(
+                self.predict_samples, transforms=self.predict_transforms
+            )
 
-    def setup_fit(self):
-        self.train_dataset = SegDataset(
-            self.train_split,
-            transforms=self.train_transforms,
-        )
-
-        self.val_dataset = SegDataset(
-            self.val_split,
-            transforms=self.val_transforms,
-        )
-
-    def setup_test(self):
-        self.test_dataset = SegTestDataset(
-            self.test_samples,
-            transforms=self.test_transforms,
-        )
-
-    def setup_predict(self):
-        self.predict_dataset = SingleSubjectPredictDataset(
-            self.predict_samples,
-            transforms=self.predict_transforms,
-        )
-
-    def train_dataloader(self):
-        sampler = RandomSampler(self.train_dataset, num_samples=999999, replacement=True)
-        if dist.is_initialized():
-            sampler = DistributedSamplerWrapper(sampler)
-
-        return self._loader(
-            self.train_dataset, batch_size=self.batch_size,
-            drop_last=True, sampler=sampler,
-        )
-
-    def val_dataloader(self):
-        return self._loader(
-            self.val_dataset, batch_size=self.batch_size,
-            drop_last=False, shuffle=False,
-        )
-
-    def test_dataloader(self):
-        return self._loader(self.test_dataset, batch_size=1, shuffle=False)
-
-    def predict_dataloader(self):
-        return self._loader(self.predict_dataset, batch_size=1, shuffle=False)
-
-    def _loader(self, dataset, **kwargs):
+    def _loader(self, dataset, **kwargs) -> DataLoader:
         loader_kwargs = {
             "dataset": dataset,
             "num_workers": self.num_workers,
@@ -129,6 +105,48 @@ class SegDataModule(pl.LightningDataModule):
         if self.num_workers > 0:
             loader_kwargs["prefetch_factor"] = self.prefetch_factor
         return DataLoader(**loader_kwargs)
+
+    def train_dataloader(self) -> DataLoader:
+        number_of_samples = self.train_num_samples or len(self.train_dataset)
+        generator = torch.Generator().manual_seed(self.sampler_seed)
+        sampler = RandomSampler(
+            self.train_dataset,
+            replacement=True,
+            num_samples=number_of_samples,
+            generator=generator,
+        )
+        if dist.is_initialized():
+            sampler = DistributedSamplerWrapper(sampler)
+        return self._loader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            drop_last=True,
+            sampler=sampler,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return self._loader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            drop_last=False,
+            shuffle=False,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        return self._loader(
+            self.test_dataset,
+            batch_size=1,
+            drop_last=False,
+            shuffle=False,
+        )
+
+    def predict_dataloader(self) -> DataLoader:
+        return self._loader(
+            self.predict_dataset,
+            batch_size=1,
+            drop_last=False,
+            shuffle=False,
+        )
 
 
 class ClsRegDataModule(pl.LightningDataModule):

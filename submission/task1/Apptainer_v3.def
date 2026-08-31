@@ -1,0 +1,125 @@
+Bootstrap: docker
+
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author Amirhossein Rasoulian
+    Challenge FOMO26
+    Task Task 1 - Infarct Classification
+    Version v2.1.0
+    Description BrainDINO ViT-S full-volume infarct classification image
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    export XDG_CACHE_HOME=/tmp/.cache
+    export MPLCONFIGDIR=/tmp/matplotlib
+    export TORCH_HOME=/tmp/torch
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+
+    export MODEL_DIR=/app/model
+    export CHECKPOINT_NAME=last
+
+    export ASPARAGUS_DATA=/input
+    export ASPARAGUS_MODELS=/app/model
+    export ASPARAGUS_RESULTS=/output
+    export ASPARAGUS_CONFIGS=/app/configs
+    export ASPARAGUS_RAW_LABELS=/app/raw_labels
+
+    export ASPARAGUS_PRETRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_TRAIN_CONFIGS=/app/configs
+    export ASPARAGUS_FINETUNE_CONFIGS=/app/configs
+    export ASPARAGUS_EVAL_BOX_CONFIGS=/app/configs
+
+    export WANDB_MODE=disabled
+    export WANDB_SILENT=true
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+
+%files
+    # Build from /scratch/01/ahrasoulian/projects/fomo26.
+
+    fomo26-lesion-impossible/submission/task1/predict_v3.py /app/predict.py
+    fomo26-lesion-impossible/requirements.txt /app/requirements.txt
+    fomo26-lesion-impossible/asparagus /app/asparagus
+    fomo26-lesion-impossible/configs /app/configs
+
+    # Task 1 run used for this image. It must contain checkpoints/last.ckpt
+    # and hydra/config.yaml (or .hydra/config.yaml).
+    models/CLS002_FOMO26_Infarct/task_vit_s_cls__3D/script=finetune_cls/root=lesion_impossible__stem=finetune/leaf=projects/lesion_impossible/finetune/task1_infarct_cls.yaml__clargs=/split_95_05_00__fold=4/run_id=984982 /app/model
+
+%post
+    set -eu
+
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/app
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p \
+        /app/raw_labels \
+        /tmp/.cache \
+        /tmp/matplotlib \
+        /tmp/torch \
+        /tmp/torchinductor_cache \
+        /tmp/triton_cache
+
+    grep -viE \
+        '^[[:space:]]*(torch|torchvision|torchaudio|triton|nvidia-[A-Za-z0-9_.-]+)([<>=!~[:space:]].*)?$' \
+        /app/requirements.txt \
+        > /app/requirements-runtime.txt
+
+    python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        --prefer-binary \
+        -r /app/requirements-runtime.txt
+
+    chmod +x /app/predict.py
+
+    test -f /app/model/checkpoints/last.ckpt
+    test -f /app/model/hydra/config.yaml || \
+        test -f /app/model/.hydra/config.yaml
+
+%test
+    python -c "import torch; import lightning; import hydra; import nibabel"
+    test -f /app/model/checkpoints/last.ckpt
+    test -f /app/model/hydra/config.yaml || \
+        test -f /app/model/.hydra/config.yaml
+    python /app/predict.py --help >/dev/null
+
+%runscript
+    exec python /app/predict.py "$@"
+
+%help
+    This container runs the FOMO26 Task 1 BrainDINO ViT-S infarct classifier.
+
+    Build from /scratch/01/ahrasoulian/projects/fomo26:
+
+        singularity build --fakeroot task1_v2.sif \
+            fomo26-lesion-impossible/submission/task1/Apptainer.def
+
+    Run:
+
+        singularity run --nv \
+            --bind /path/to/input:/input:ro \
+            --bind /path/to/output:/output \
+            task1_v2.sif \
+            --flair /input/flair.nii.gz \
+            --adc /input/adc.nii.gz \
+            --dwi /input/dwi.nii.gz \
+            --swi /input/swi.nii.gz \
+            --output /output/infarct_probability.txt

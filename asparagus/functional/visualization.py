@@ -182,22 +182,110 @@ def _log_images_to_mlflow(logger, prefix, slice_idx, step, image0, image1, image
     )
 
 
-def get_logger_compatible_image_output_target(image, output, target, task_type: str = "segmentation"):
-    channel_idx = np.random.randint(0, image.shape[0])
+def get_logger_compatible_image_output_target(
+    image,
+    output,
+    target,
+    task_type: str = "segmentation",
+):
+    image = np.asarray(image)
+    output = np.asarray(output)
+    target = np.asarray(target)
 
-    if len(image.shape) == 4:  # 3D images.
-        # We need to select a slice to visualize.
-        if task_type == "segmentation" and len(target[0].nonzero()[0]) > 0:
-            # Select a foreground slice if any exist.
-            foreground_locations = target[0].nonzero()
-            slice_to_visualize = foreground_locations[0][np.random.randint(0, len(foreground_locations[0]))]
+    if image.ndim < 3:
+        raise ValueError(
+            f"Expected an image with spatial dimensions, got {image.shape}."
+        )
+
+    # Select the channel with the greatest spatial variation. This avoids
+    # visualizing a zero-filled missing modality.
+    channel_variances = np.asarray(
+        [
+            np.nanvar(image[channel].astype(np.float32))
+            for channel in range(image.shape[0])
+        ],
+        dtype=np.float32,
+    )
+
+    finite_channels = np.isfinite(channel_variances)
+    if finite_channels.any():
+        safe_variances = np.where(
+            finite_channels,
+            channel_variances,
+            -np.inf,
+        )
+        channel_idx = int(np.argmax(safe_variances))
+    else:
+        channel_idx = 0
+
+    if image.ndim == 4:
+        # Arrays use [C, H, W, D]. Always select a slice along D,
+        # which is the final axis.
+        depths = [image.shape[-1]]
+
+        if target.ndim >= 3:
+            depths.append(target.shape[-1])
+        if output.ndim >= 3:
+            depths.append(output.shape[-1])
+
+        common_depth = min(int(depth) for depth in depths)
+
+        if common_depth < 1:
+            raise ValueError(
+                "Cannot visualize an empty volume: "
+                f"image={image.shape}, output={output.shape}, "
+                f"target={target.shape}."
+            )
+
+        if task_type == "segmentation":
+            # Convert target into one [H, W, D] integer label map.
+            if target.ndim == 4:
+                if target.shape[0] == 1:
+                    target_volume = target[0]
+                else:
+                    # Also supports one-hot encoded targets.
+                    target_volume = target.argmax(axis=0)
+            elif target.ndim == 3:
+                target_volume = target
+            else:
+                raise ValueError(
+                    "Segmentation target must be [H, W, D], "
+                    "[1, H, W, D], or [C, H, W, D], but got "
+                    f"{target.shape}."
+                )
+
+            target_volume = target_volume[..., :common_depth]
+
+            # For multiclass segmentation, IDs greater than zero are
+            # foreground. Choose the slice with the greatest total
+            # foreground area.
+            foreground_per_slice = (
+                target_volume > 0
+            ).reshape(-1, common_depth).sum(axis=0)
+
+            if foreground_per_slice.max() > 0:
+                slice_to_visualize = int(
+                    foreground_per_slice.argmax()
+                )
+            else:
+                slice_to_visualize = common_depth // 2
         else:
-            slice_to_visualize = image.shape[-1] // 2
+            slice_to_visualize = common_depth // 2
+
+        slice_to_visualize = int(
+            np.clip(
+                slice_to_visualize,
+                0,
+                common_depth - 1,
+            )
+        )
 
         image = image[..., slice_to_visualize]
-        if len(target.shape) == 4:
+
+        if target.ndim in (3, 4):
             target = target[..., slice_to_visualize]
-        if len(output.shape) == 4:
+
+        if output.ndim in (3, 4):
             output = output[..., slice_to_visualize]
 
     image = normalize_array_to_pil(image[channel_idx])
@@ -205,20 +293,52 @@ def get_logger_compatible_image_output_target(image, output, target, task_type: 
     if task_type == "classification":
         target = np.round(target.squeeze(0), decimals=3)
         output = np.round(output.argmax(0), decimals=3)
+
     elif task_type == "regression":
         target = np.round(target.squeeze(0), decimals=3)
         output = np.round(output.squeeze(0), decimals=3)
+
     elif task_type == "segmentation":
-        target = target.squeeze(0)
-        output = output.argmax(0)
+        # Target can be an integer map with one channel or a one-hot map.
+        if target.ndim == 3:
+            if target.shape[0] == 1:
+                target = target[0]
+            else:
+                target = target.argmax(axis=0)
+        elif target.ndim != 2:
+            raise ValueError(
+                "The sliced segmentation target must be [H, W], "
+                f"[1, H, W], or [C, H, W], got {target.shape}."
+            )
+
+        # Output is normally multiclass probabilities [C, H, W].
+        if output.ndim == 3:
+            if output.shape[0] == 1:
+                # Compatibility with an older binary one-channel model.
+                output = (output[0] >= 0.5).astype(np.int32)
+            else:
+                output = output.argmax(axis=0)
+        elif output.ndim != 2:
+            raise ValueError(
+                "The sliced segmentation output must be [H, W], "
+                f"[1, H, W], or [C, H, W], got {output.shape}."
+            )
+
+        # W&B segmentation masks should contain integer class IDs.
+        target = np.rint(target).astype(np.int32)
+        output = np.rint(output).astype(np.int32)
+
     elif task_type == "self-supervised":
         target = normalize_array_to_pil(target[channel_idx])
         output = normalize_array_to_pil(output[channel_idx])
+
     else:
-        logging.warn(
-            f"Unknown task type. Found {task_type} and expected one in ['classification',\
-                  'regression', 'segmentation', 'self-supervised']"
+        logging.warning(
+            "Unknown task type %r. Expected classification, regression, "
+            "segmentation, or self-supervised.",
+            task_type,
         )
+
     return image, output, target
 
 
@@ -238,6 +358,36 @@ def log_image_output_target_to_wandb(
     if task_type in ["classification", "regression"]:
         fig = wandb.Image(image, mode="L", caption=f"P: {output} | GT: {target} | {fig_title}")
     elif task_type == "segmentation":
+        output = np.asarray(output).astype(np.int32)
+        target = np.asarray(target).astype(np.int32)
+
+        if output.ndim != 2 or target.ndim != 2:
+            raise ValueError(
+                "W&B segmentation masks must be 2-D after slice selection; "
+                f"output={output.shape}, target={target.shape}."
+            )
+
+        # Register only foreground classes. Class 0 is intentionally omitted so
+        # W&B treats it as background instead of drawing a blue overlay.
+        foreground_ids = sorted(
+            {
+                int(class_id)
+                for class_id in np.concatenate(
+                [np.unique(output), np.unique(target)]
+            )
+                if int(class_id) > 0
+            }
+        )
+
+        class_labels = {
+            class_id: (
+                "foreground"
+                if len(foreground_ids) == 1
+                else f"class_{class_id}"
+            )
+            for class_id in foreground_ids
+        }
+
         fig = [
             wandb.Image(
                 image,
@@ -245,15 +395,23 @@ def log_image_output_target_to_wandb(
                 masks={
                     "predictions": {
                         "mask_data": output,
+                        "class_labels": class_labels,
                     },
                     "ground_truth": {
                         "mask_data": target,
+                        "class_labels": class_labels,
                     },
                 },
                 caption=fig_title,
             ),
-            wandb.Image(output, mode="L", caption="output"),
-            wandb.Image(target, mode="L", caption="target"),
+            wandb.Image(
+                normalize_array_to_pil(output.astype(np.float32)),
+                caption="predicted class map",
+            ),
+            wandb.Image(
+                normalize_array_to_pil(target.astype(np.float32)),
+                caption="ground-truth class map",
+            ),
         ]
     elif task_type == "self-supervised":
         fig = [

@@ -1,7 +1,4 @@
 from __future__ import annotations
-from typing import Any, Sequence
-import torch
-
 from gardening_tools.modules.transforms.bias_field import Torch_BiasField
 from gardening_tools.modules.transforms.blur import Torch_Blur
 from gardening_tools.modules.transforms.deep_supervision import Torch_DownsampleSegForDS
@@ -9,224 +6,320 @@ from gardening_tools.modules.transforms.gamma import Torch_Gamma
 from gardening_tools.modules.transforms.mirror import Torch_Mirror
 from gardening_tools.modules.transforms.motion_ghosting import Torch_MotionGhosting
 from gardening_tools.modules.transforms.noise import Torch_AdditiveNoise, Torch_MultiplicativeNoise
-from gardening_tools.modules.transforms.normalize import Torch_Normalize
 from gardening_tools.modules.transforms.ringing import Torch_GibbsRinging
 from gardening_tools.modules.transforms.sampling import Torch_SimulateLowres
 from gardening_tools.modules.transforms.spatial import Torch_Spatial
-from asparagus.modules.transforms.crop import Torch_Crop
-from asparagus.modules.transforms.pad import Torch_Pad
+from .braindino_transforms import CenterCropByFraction3d
+import math
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+import torch
+import torch.nn.functional as F
+from gardening_tools.modules.transforms.normalize import Torch_Normalize
 from torchvision import transforms
 
+def _label_key(sample: Mapping[str, Any]) -> str:
+    if "label" in sample:
+        return "label"
+    if "SEG_label" in sample:
+        return "SEG_label"
+    raise KeyError("Segmentation transform requires label or SEG_label.")
 
-class Torch_PadToDivisible:
-    """Pad every spatial dimension to a multiple of `divisor`."""
 
-    def __init__(
-        self,
-        divisor: int = 8,
-        data_key: str = "image",
-        label_key: str = "label",
-        pad_value: str | int | float = "min",
-    ):
-        if divisor <= 0:
-            raise ValueError("divisor must be positive.")
+def _integer_label(label: torch.Tensor) -> torch.Tensor:
+    if not torch.isfinite(label.float()).all():
+        raise FloatingPointError("Label contains non-finite values.")
+    rounded = label.round()
+    if not torch.allclose(label.float(), rounded.float(), atol=1e-4, rtol=0.0):
+        raise ValueError("Segmentation labels must contain integer class IDs.")
+    if (rounded < 0).any():
+        raise ValueError("Segmentation class IDs must be non-negative.")
+    return rounded.to(label.dtype)
 
-        self.divisor = int(divisor)
-        self.data_key = data_key
-        self.label_key = label_key
-        self.pad_value = pad_value
 
-    def __call__(self, data_dict: dict) -> dict:
-        image = data_dict[self.data_key]
+@dataclass
+class RandomSegmentationAffine3d:
+    """Joint shape-preserving 3-D affine/flip for images and class maps."""
 
-        # Image shape is [C, D, H, W] or [C, H, W].
-        spatial_shape = image.shape[1:]
+    probability: float = 0.3
+    rotation_degrees: float = 5.0
+    scale_min: float = 0.95
+    scale_max: float = 1.05
+    translation_fraction: float = 0.02
+    flip_probability: float = 0.5
 
-        padded_shape = tuple(
-            ((int(size) + self.divisor - 1) // self.divisor)
-            * self.divisor
-            for size in spatial_shape
-        )
-
-        if tuple(spatial_shape) == padded_shape:
-            return data_dict
-
-        return Torch_Pad(
-            data_key=self.data_key,
-            label_key=self.label_key,
-            patch_size=padded_shape,
-            pad_value=self.pad_value,
-        )(data_dict)
-
-class Torch_RandomSizeCrop:
-    """Randomly crop to a size between `min_size` and `max_size`.
-
-    A common random scale is applied to every spatial dimension, preserving
-    the aspect ratio implied by `min_size`. The selected dimensions are rounded
-    to multiples of `size_divisor`, which should normally match the ViT patch
-    size.
-
-    Padding is performed only when cropping is selected and only to ensure that
-    the requested crop fits inside the input image.
-    """
-
-    def __init__(
-        self,
-        min_size: Sequence[int],
-        max_size: Sequence[int] | None = None,
-        p: float = 0.5,
-        size_divisor: int = 8,
-        p_oversample_foreground: float = 0.0,
-    ) -> None:
-        self.min_size = tuple(int(size) for size in min_size)
-
-        if max_size is None:
-            self.max_size = tuple(
-                2 * size for size in self.min_size
-            )
-        else:
-            self.max_size = tuple(
-                int(size) for size in max_size
-            )
-
-        if not self.min_size:
-            raise ValueError("min_size cannot be empty.")
-
-        if len(self.min_size) != len(self.max_size):
-            raise ValueError(
-                "min_size and max_size must have the same number "
-                "of dimensions."
-            )
-
-        if any(size <= 0 for size in self.min_size):
-            raise ValueError(
-                "Every min_size dimension must be positive."
-            )
-
-        if any(size <= 0 for size in self.max_size):
-            raise ValueError(
-                "Every max_size dimension must be positive."
-            )
-
-        if any(
-            maximum < minimum
-            for minimum, maximum in zip(
-                self.min_size,
-                self.max_size,
-            )
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("probability", self.probability),
+            ("flip_probability", self.flip_probability),
         ):
-            raise ValueError(
-                "Every max_size dimension must be greater than or "
-                "equal to the corresponding min_size dimension."
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1].")
+        if self.rotation_degrees < 0.0:
+            raise ValueError("rotation_degrees must be non-negative.")
+        if not 0.0 < self.scale_min <= self.scale_max:
+            raise ValueError("Require 0 < scale_min <= scale_max.")
+        if not 0.0 <= self.translation_fraction <= 0.5:
+            raise ValueError("translation_fraction must be in [0, 0.5].")
+
+    @staticmethod
+    def _rotation_matrix(angles: torch.Tensor) -> torch.Tensor:
+        ax, ay, az = angles
+        del ax, ay, az
+        cx, cy, cz = torch.cos(angles)
+        sx, sy, sz = torch.sin(angles)
+        one = torch.ones((), dtype=angles.dtype, device=angles.device)
+        zero = torch.zeros((), dtype=angles.dtype, device=angles.device)
+        rx = torch.stack(
+            (
+                torch.stack((one, zero, zero)),
+                torch.stack((zero, cx, -sx)),
+                torch.stack((zero, sx, cx)),
             )
-
-        if not 0.0 <= p <= 1.0:
-            raise ValueError("p must be in [0, 1].")
-
-        if size_divisor <= 0:
-            raise ValueError(
-                "size_divisor must be positive."
-            )
-
-        if not 0.0 <= p_oversample_foreground <= 1.0:
-            raise ValueError(
-                "p_oversample_foreground must be in [0, 1]."
-            )
-
-        self.p = float(p)
-        self.size_divisor = int(size_divisor)
-        self.p_oversample_foreground = float(
-            p_oversample_foreground
         )
-
-        scale_limits = [
-            maximum / minimum
-            for minimum, maximum in zip(
-                self.min_size,
-                self.max_size,
+        ry = torch.stack(
+            (
+                torch.stack((cy, zero, sy)),
+                torch.stack((zero, one, zero)),
+                torch.stack((-sy, zero, cy)),
             )
-        ]
-        self.maximum_common_scale = min(scale_limits)
+        )
+        rz = torch.stack(
+            (
+                torch.stack((cz, -sz, zero)),
+                torch.stack((sz, cz, zero)),
+                torch.stack((zero, zero, one)),
+            )
+        )
+        return rz @ ry @ rx
 
-    def _round_to_divisor(
+    def _affine(
         self,
-        size: float,
-        minimum: int,
-        maximum: int,
-    ) -> int:
-        rounded = int(
-            round(size / self.size_divisor)
-            * self.size_divisor
+        image: torch.Tensor,
+        label: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        # Project layout is [C, H, W, D]; grid_sample expects [N, C, D, H, W].
+        image_dhw = image.permute(0, 3, 1, 2).unsqueeze(0).float()
+        label_dhw = label.permute(0, 3, 1, 2).unsqueeze(0).float()
+
+        maximum_angle = math.radians(self.rotation_degrees)
+        angles = torch.empty(3, device=image.device).uniform_(
+            -maximum_angle, maximum_angle
+        )
+        scale = torch.empty((), device=image.device).uniform_(
+            self.scale_min, self.scale_max
+        )
+        translation = torch.empty(3, device=image.device).uniform_(
+            -self.translation_fraction, self.translation_fraction
         )
 
-        rounded = max(minimum, rounded)
-        rounded = min(maximum, rounded)
+        theta = torch.zeros((1, 3, 4), device=image.device)
+        theta[0, :, :3] = self._rotation_matrix(angles) / scale
+        theta[0, :, 3] = 2.0 * translation
+        grid = F.affine_grid(theta, image_dhw.shape, align_corners=False)
 
-        return rounded
-
-    def _sample_crop_size(self) -> tuple[int, ...]:
-        random_scale = float(
-            torch.empty(1).uniform_(
-                1.0,
-                self.maximum_common_scale,
-            )
+        transformed_image = F.grid_sample(
+            image_dhw,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
         )
-
-        return tuple(
-            self._round_to_divisor(
-                size=minimum * random_scale,
-                minimum=minimum,
-                maximum=maximum,
-            )
-            for minimum, maximum in zip(
-                self.min_size,
-                self.max_size,
-            )
+        transformed_label = F.grid_sample(
+            label_dhw,
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=False,
         )
+        image = transformed_image[0].permute(0, 2, 3, 1).to(image.dtype)
+        label = transformed_label[0].permute(0, 2, 3, 1).round().to(label.dtype)
+        metadata = {
+            "theta": theta[0].detach().cpu(),
+            "angles_radians": angles.detach().cpu(),
+            "scale": float(scale.detach().cpu()),
+            "translation_fraction": translation.detach().cpu(),
+        }
+        return image, label, metadata
 
-    def __call__(self, sample: Any) -> Any:
-        if self.p == 0.0:
-            return sample
+    def __call__(self, sample: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(sample)
+        image = torch.as_tensor(result["image"])
+        label = torch.as_tensor(result[_label_key(result)])
+        if image.ndim != 4 or label.ndim != 4:
+            raise ValueError("image and label must be [C, H, W, D].")
+        if image.shape[1:] != label.shape[1:]:
+            raise ValueError("Image and label spatial shapes must match.")
+        label = _integer_label(label)
 
-        if self.p < 1.0 and torch.rand(1).item() >= self.p:
-            return sample
+        original_shape = tuple(int(value) for value in image.shape[1:])
+        foreground_before = int((label > 0).sum())
+        affine_metadata = None
+        if torch.rand(()).item() < self.probability:
+            # Both calls inside _affine use this exact same grid. MRI uses
+            # trilinear interpolation; the class map uses nearest neighbour.
+            image, label, affine_metadata = self._affine(image, label)
 
-        crop_size = self._sample_crop_size()
+        flipped_dimensions: list[int] = []
+        # flip_probability is an overall per-sample probability. Conditional
+        # on flipping, independently choose axes but ensure at least one axis.
+        if torch.rand(()).item() < self.flip_probability:
+            flipped_dimensions = [
+                dimension
+                for dimension in (1, 2, 3)
+                if torch.rand(()).item() < 0.5
+            ]
+            if not flipped_dimensions:
+                flipped_dimensions = [int(torch.randint(1, 4, ()).item())]
+            image = torch.flip(image, dims=flipped_dimensions)
+            label = torch.flip(label, dims=flipped_dimensions)
 
-        # Padding and cropping are kept together so samples for which the
-        # transform is skipped retain their original full-volume size.
-        sample = Torch_Pad(
-            patch_size=crop_size,
-        )(sample)
+        if tuple(image.shape[1:]) != original_shape:
+            raise RuntimeError("Spatial augmentation changed the image shape.")
+        if image.shape[1:] != label.shape[1:]:
+            raise RuntimeError("Spatial augmentation desynchronized image/label.")
+        label = _integer_label(label).contiguous()
+        result["image"] = image.contiguous()
+        result["label"] = label
+        result["SEG_label"] = label
+        transforms_applied = dict(result.get("transforms_applied") or {})
+        transforms_applied["segmentation_spatial"] = {
+            "affine": affine_metadata,
+            "flipped_tensor_dimensions": flipped_dimensions,
+            "foreground_voxels_before": foreground_before,
+            "foreground_voxels_after": int((label > 0).sum()),
+        }
+        result["transforms_applied"] = transforms_applied
+        info = dict(result.get("info") or {})
+        info["valid_spatial_shapes"] = torch.tensor(
+            original_shape, dtype=torch.long
+        )
+        result["info"] = info
+        return result
 
-        sample = Torch_Crop(
-            patch_size=crop_size,
-            p_oversample_foreground=(
-                self.p_oversample_foreground
+
+def verify_joint_segmentation_augmentation(
+    trials: int = 16,
+    minimum_dice: float = 0.90,
+) -> float:
+    """Synthetic check that MRI channels and the label share one transform.
+
+    The synthetic image channels exactly equal the foreground mask before the
+    transform. MRI interpolation softens boundaries, so agreement is checked
+    after a 0.5 threshold rather than requiring bitwise equality.
+    """
+    if trials < 1:
+        raise ValueError("trials must be positive.")
+    label = torch.zeros((1, 48, 48, 48), dtype=torch.float32)
+    label[:, 14:34, 17:36, 12:32] = 1.0
+    image = label.repeat(3, 1, 1, 1)
+    transform = RandomSegmentationAffine3d(
+        probability=1.0,
+        rotation_degrees=8.0,
+        scale_min=0.95,
+        scale_max=1.05,
+        translation_fraction=0.03,
+        flip_probability=1.0,
+    )
+
+    scores = []
+    with torch.random.fork_rng():
+        torch.manual_seed(12345)
+        for _ in range(trials):
+            transformed = transform(
+                {
+                    "image": image.clone(),
+                    "label": label.clone(),
+                    "info": {},
+                    "transforms_applied": {},
+                }
+            )
+            transformed_label = transformed["label"] > 0
+            for channel in transformed["image"]:
+                transformed_image = channel.unsqueeze(0) >= 0.5
+                intersection = (transformed_image & transformed_label).sum()
+                denominator = transformed_image.sum() + transformed_label.sum()
+                score = float(
+                    (2.0 * intersection.float() / denominator.clamp_min(1)).cpu()
+                )
+                scores.append(score)
+
+    worst_score = min(scores)
+    if worst_score < minimum_dice:
+        raise AssertionError(
+            "Image/label augmentation alignment check failed: "
+            f"minimum Dice={worst_score:.4f} < {minimum_dice:.4f}."
+        )
+    return worst_score
+
+
+class ValidateSegmentationSample:
+    def __call__(self, sample: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(sample)
+        image = torch.as_tensor(result["image"])
+        label = torch.as_tensor(result[_label_key(result)])
+        if image.ndim != 4 or label.ndim != 4:
+            raise ValueError("image and label must be [C, H, W, D].")
+        if image.shape[1:] != label.shape[1:]:
+            raise ValueError(
+                f"Image shape {tuple(image.shape)} and label shape "
+                f"{tuple(label.shape)} do not match."
+            )
+        if not torch.isfinite(image).all():
+            raise FloatingPointError("Image contains non-finite values.")
+        label = _integer_label(label).contiguous()
+        result["label"] = label
+        result["SEG_label"] = label
+        info = dict(result.get("info") or {})
+        info["valid_spatial_shapes"] = torch.tensor(
+            image.shape[1:], dtype=torch.long
+        )
+        result["info"] = info
+        return result
+
+
+def CPU_vit_seg_train_transforms(
+    normalize: bool = True,
+    affine_probability: float = 0.3,
+    rotation_degrees: float = 5.0,
+    scale_range: tuple[float, float] = (0.95, 1.05),
+    translation_fraction: float = 0.02,
+    flip_probability: float = 0.5,
+):
+    return transforms.Compose(
+        [
+            Torch_Normalize(normalize=normalize),
+            RandomSegmentationAffine3d(
+                probability=affine_probability,
+                rotation_degrees=rotation_degrees,
+                scale_min=float(scale_range[0]),
+                scale_max=float(scale_range[1]),
+                translation_fraction=translation_fraction,
+                flip_probability=flip_probability,
             ),
-        )(sample)
+            ValidateSegmentationSample(),
+        ]
+    )
 
-        return sample
 
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}("
-            f"min_size={self.min_size}, "
-            f"max_size={self.max_size}, "
-            f"p={self.p}, "
-            f"size_divisor={self.size_divisor}, "
-            "p_oversample_foreground="
-            f"{self.p_oversample_foreground})"
-        )
+def CPU_vit_seg_val_transforms(normalize: bool = True):
+    return transforms.Compose(
+        [
+            Torch_Normalize(normalize=normalize),
+            ValidateSegmentationSample(),
+        ]
+    )
 
 def CPU_vit_train_transforms(
     normalize: bool = True,
     target_size: tuple[int, int, int] = (128, 128, 128),
+    center_crop_fraction: float = 1.0,
 ):
-    """Full-volume classification/regression training preprocessing.
+    """Full-volume classification/regression training transforms.
 
-    Spatial augmentations are applied to the image only because classification
-    and regression labels are subject-level targets.
+    Spatial transforms preserve the post-center-crop tensor dimensions.
+    Subject-level classification/regression targets are not transformed.
     """
     if len(target_size) == 2:
         axes = (0, 1)
@@ -240,50 +333,30 @@ def CPU_vit_train_transforms(
 
     return transforms.Compose(
         [
+            CenterCropByFraction3d(
+                fraction=center_crop_fraction,
+            ),
             Torch_Normalize(
                 normalize=normalize,
             ),
-            Torch_RandomSizeCrop(
-                min_size=target_size,
-                max_size=tuple(2 * size for size in target_size),
-                p=0.5,
-                size_divisor=8,
-                p_oversample_foreground=0.0,
-            ),
             Torch_Spatial(
                 patch_size=target_size,
-
-                # Mild deformation. Avoid strong deformation because small
-                # infarcts should not be erased or severely distorted.
-                p_deform_all_channel=0.10,
-
-                # More frequent but less extreme rotations.
-                p_rot_all_channel=0.50,
-                p_rot_per_axis=0.50,
-                x_rot_in_degrees=(-15.0, 15.0),
-                y_rot_in_degrees=(-15.0, 15.0),
-                z_rot_in_degrees=(-15.0, 15.0),
-
-                # Frequent, anatomically plausible scale augmentation.
-                p_scale_all_channel=0.40,
-                scale_factor=(0.85, 1.20),
-
-                # Preserve the full-volume pipeline.
+                p_deform_all_channel=0.0,
+                p_rot_all_channel=0.25,
+                p_rot_per_axis=0.25,
+                x_rot_in_degrees=(-10.0, 10.0),
+                y_rot_in_degrees=(-10.0, 10.0),
+                z_rot_in_degrees=(-10.0, 10.0),
+                p_scale_all_channel=0.25,
+                scale_factor=(0.90, 1.10),
                 crop=False,
                 clip_to_input_range=False,
-
-                # Classification/regression labels are scalar targets and
-                # must not be spatially transformed.
                 skip_label=True,
             ),
             Torch_Mirror(
-                p_per_sample=1.0,
-                p_mirror_per_axis=0.50,
+                p_per_sample=0.25,
+                p_mirror_per_axis=0.25,
                 axes=axes,
-            ),
-            Torch_PadToDivisible(
-                divisor=8,
-                pad_value="min",
             ),
         ]
     )
@@ -291,17 +364,15 @@ def CPU_vit_train_transforms(
 
 def CPU_vit_val_test_transforms(
     normalize: bool = True,
-    target_size: tuple[int, int, int] = (128, 128, 128),
+    center_crop_fraction: float = 1.0,
 ):
-    """Deterministic full-volume validation and test preprocessing."""
     return transforms.Compose(
         [
+            CenterCropByFraction3d(
+                fraction=center_crop_fraction,
+            ),
             Torch_Normalize(
                 normalize=normalize,
-            ),
-            Torch_PadToDivisible(
-                divisor=8,
-                pad_value="min",
             ),
         ]
     )
@@ -329,39 +400,39 @@ def GPU_vit_all_train_transforms(
         [
             # Scanner resolution and reconstruction variability.
             Torch_Blur(
-                p_per_channel=0.25,
+                p_per_channel=0.05,
             ),
             Torch_SimulateLowres(
-                p_per_channel=0.40,
-                p_per_axis=0.35,
+                p_per_channel=0.10,
+                p_per_axis=0.25,
             ),
 
             # Smooth intensity non-uniformity.
             Torch_BiasField(
-                p_per_channel=0.30,
+                p_per_channel=0.15,
             ),
 
             # Global nonlinear contrast variability.
             Torch_Gamma(
-                p_all_channel=0.30,
+                p_all_channel=0.15,
             ),
 
             # MRI acquisition and reconstruction artifacts.
             Torch_MotionGhosting(
-                p_per_channel=0.20,
+                p_per_channel=0.05,
                 axes=axes,
             ),
             Torch_GibbsRinging(
-                p_per_channel=0.20,
+                p_per_channel=0.05,
                 axes=axes,
             ),
 
             # Signal-level variability.
             Torch_MultiplicativeNoise(
-                p_per_channel=0.20,
+                p_per_channel=0.10,
             ),
             Torch_AdditiveNoise(
-                p_per_channel=0.20,
+                p_per_channel=0.10,
             ),
         ]
     )

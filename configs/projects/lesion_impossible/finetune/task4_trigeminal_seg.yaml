@@ -1,0 +1,60 @@
+# @package _global_
+defaults:
+  - /vit_finetune
+  - /model/braindino_vit_s@model
+  - /hardware/3gpu12cpu@hardware
+  - _self_
+
+task: SEG010_FOMO26_TrigeminalNeuralgia
+root: lesion_impossible
+stem: finetune
+
+checkpoint_run_id: 606554
+load_checkpoint_name: "last.ckpt"
+
+model:
+  net: ${model.seg_net}
+  output_channels: 3
+
+  min_backbone_load_fraction: 0.99
+  freeze_backbone: false
+  trainable_backbone_blocks: 0
+  backbone_lr_multiplier: 0.03
+
+  grid_size: [32, 48, 32]
+  patch_kernel_size: 8
+  window_size: [4, 4, 4]
+  summary_grid_size: [8, 8, 8]
+
+  decoder_hidden_dim: 64
+  decoder_dropout: 0.05
+  decoder_max_scale: 4
+  initial_foreground_probability: 0.1
+
+lightning:
+  data_module: SegDataModule
+  lightning_module: ViTSegmentationModule
+
+training:
+  label_key: SEG_label
+
+  ce_weight: 0.35
+  dice_weight: 0.65
+  class_weights: null
+  include_background_in_dice: false
+
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+transforms:
+  normalize: true
+  affine_probability: 0.2
+  rotation_degrees: 5.0
+  scale_range: [0.97, 1.03]
+  translation_fraction: 0.02
+  flip_probability: 0.2
+
+  cpu_tr_transforms: CPU_vit_seg_train_transforms
+  cpu_val_transforms: CPU_vit_seg_val_transforms
+  gpu_tr_transforms: GPU_vit_all_train_transforms
+  gpu_val_transforms:
